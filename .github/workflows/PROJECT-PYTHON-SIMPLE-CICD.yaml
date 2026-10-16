@@ -1,0 +1,374 @@
+# project-auto-wizard:managed-workflow
+# Python FastAPI CI/CD deployment (SSH + Docker)
+# Builds a Docker image when the main branch is pushed and
+# deploys it automatically to any server reachable over SSH (Synology, AWS EC2, VPS, ...).
+#
+# Required GitHub Secrets
+# ENV_FILE: contents of the .env file
+# DOCKERHUB_USERNAME: DockerHub username
+# DOCKERHUB_TOKEN: DockerHub access token
+# SERVER_HOST: deploy server address
+# SERVER_USER: SSH username
+# SERVER_PASSWORD: SSH password (when SSH_AUTH_METHOD=password)
+# SSH_KEY: contents of the SSH private key .pem (when SSH_AUTH_METHOD=key, e.g. AWS EC2)
+#
+# Environment variables are set in the env section below; each line has its description and default.
+# HEALTHCHECK_PATH examples: FastAPI "/docs", custom "/api/v1/health"
+
+name: PROJECT-PYTHON-SIMPLE-CICD
+
+on:
+  push:
+    branches:
+      - "main"  # production deploy
+    paths: ['python/**']
+  workflow_dispatch:  # allow manual runs
+
+env:
+  # Unique project identifier
+  PROJECT_NAME: "project-auto-wizard-v4-ci-mono"
+  # Subdirectory of this project in a monorepo (--paths). Base for the build and Docker context ('.' means the repo root)
+  PROJECT_PATH: "python"
+  # In a monorepo (PROJECT_PATH is not '.') '-python' is appended to the image, container and domain names
+  # so they do not collide with services of other types in the same repo (e.g. my-app-python)
+
+  # Port settings
+  DEPLOY_PORT: "8000"
+
+  # Container name (uses PROJECT_NAME when empty)
+  CONTAINER_NAME: ""
+
+  # Volume mount settings (no mount when empty)
+  ENABLE_VOLUME_MOUNT: "false"
+  VOLUME_HOST_PATH: "/volume1/projects/project-auto-wizard-v4-ci-mono"
+  VOLUME_CONTAINER_PATH: "/mnt/project-auto-wizard-v4-ci-mono"
+
+  # SSH auth method: "password" (Synology, generic servers) | "key" (AWS EC2, .pem)
+  #   password -> uses the SERVER_PASSWORD secret
+  #   key      -> uses the SSH_KEY secret (the whole .pem file content as the secret value)
+  SSH_AUTH_METHOD: "password"
+
+  # SSH connection settings
+  SSH_PORT: "2022"
+  SSH_COMMAND_TIMEOUT: "600s"  # SSH command execution timeout
+  SSH_CONNECTION_TIMEOUT: "60s"  # SSH connection timeout
+
+  # Container port settings
+  CONTAINER_INTERNAL_PORT: "8000"  # FastAPI internal port
+
+  # Health check settings
+  HEALTHCHECK_WAIT_SECONDS: "10"  # wait for container initialization (seconds)
+  HEALTHCHECK_PATH: "/docs"  # HTTP endpoint path (only the log pattern is used when empty)
+  HEALTHCHECK_MAX_RETRIES: "5"  # HTTP retry count
+  HEALTHCHECK_RETRY_INTERVAL: "3"  # retry interval (seconds)
+  HEALTHCHECK_LOG_PATTERN: "Uvicorn running on"  # Fallback log search pattern
+
+jobs:
+  # Job: build
+  build:
+    name: Build Python FastAPI application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # If a required Secret or the Dockerfile is missing, report the missing item and stop
+      # instead of failing later with a third-party error such as docker login
+      - name: Deploy pre-check (Secrets and Dockerfile)
+        working-directory: ${{ env.PROJECT_PATH }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          DOCKERFILE: Dockerfile
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          MISSING=""
+          for NAME in DOCKERHUB_USERNAME DOCKERHUB_TOKEN SERVER_HOST SERVER_USER; do
+            [ -n "${!NAME}" ] || MISSING="$MISSING $NAME"
+          done
+          # SSH_AUTH_METHOD=key needs SSH_KEY, otherwise SERVER_PASSWORD is required
+          if [ "${SSH_AUTH_METHOD:-password}" = "key" ]; then
+            [ -n "$SSH_KEY" ] || MISSING="$MISSING SSH_KEY"
+          else
+            [ -n "$SERVER_PASSWORD" ] || MISSING="$MISSING SERVER_PASSWORD"
+          fi
+          FAILED=false
+          if [ -n "$MISSING" ]; then
+            echo "::error title=$(m cicd.precheck_secret_title)::$(m cicd.precheck_secret_body missing="$MISSING")"
+            FAILED=true
+          fi
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "::error title=$(m cicd.precheck_dockerfile_title)::$(m cicd.precheck_dockerfile_body path="${PROJECT_PATH}/${DOCKERFILE#./}")"
+            FAILED=true
+          fi
+          if [ "$FAILED" = "true" ]; then
+            exit 1
+          fi
+          m cicd.precheck_ok
+
+      - name: Free up disk space
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          m cicd.disk_before
+          df -h
+
+          m cicd.disk_cleaning
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+
+          m cicd.disk_docker_prune
+          docker system prune -af --volumes || true
+
+          m cicd.disk_after_cleanup
+          df -h
+
+      - name: Create .env file
+        working-directory: ${{ env.PROJECT_PATH }}
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          cat > .env << 'EOF'
+          ${{ secrets.ENV_FILE }}
+          EOF
+          m cicd.dotenv_created
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.PROJECT_PATH }}
+          file: ${{ env.PROJECT_PATH }}/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.PROJECT_PATH != '.' && format('{0}-python', env.PROJECT_NAME) || env.PROJECT_NAME }}:${{ github.ref_name }}
+          # Use the GitHub Actions cache (saves local disk space)
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Clean up after build
+        if: always()
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          m cicd.post_build_cleanup
+          docker system prune -f || true
+          m cicd.disk_final
+          df -h
+
+  # Job: deploy
+  deploy:
+    name: Deploy to remote server
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      # The deploy script runs on the remote server, so the messages are resolved here
+      # and handed to it through env vars (PAW_M_*)
+      - name: Checkout message catalog
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        run: |
+          [ -f .github/scripts/messages.py ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          python3 .github/scripts/messages.py dump cicd. | PYTHONIOENCODING=utf-8 python3 -c 'import json,sys; [print("PAW_M_" + k.replace(".", "_") + "=" + v) for k, v in json.load(sys.stdin).items()]' >> "$GITHUB_ENV"
+
+      - name: Deploy
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SSH_AUTH_METHOD: ${{ env.SSH_AUTH_METHOD }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          command_timeout: ${{ env.SSH_COMMAND_TIMEOUT }}
+          timeout: ${{ env.SSH_CONNECTION_TIMEOUT }}
+          envs: SSH_AUTH_METHOD
+          script: |
+            set -e
+
+            # Fill the {name} placeholders of a message template (usage: m "template" name=value ...)
+            m() { local s="$1" kv; shift; for kv in "$@"; do s="${s//\{${kv%%=*}\}/${kv#*=}}"; done; printf '%s\n' "$s"; }
+
+            # Set deploy environment variables
+            m "${{ env.PAW_M_cicd_setup_env }}"
+            export PATH=$PATH:/usr/local/bin
+            export PW=${{ secrets.SERVER_PASSWORD }}
+
+            # sudo abstraction per SSH auth method
+            #   password mode: echo $PW | sudo -S  (servers that need a sudo password, e.g. Synology)
+            #   key mode: plain sudo  (passwordless-sudo servers, e.g. AWS EC2)
+            SSH_AUTH_METHOD="${SSH_AUTH_METHOD:-password}"
+            if [ "${SSH_AUTH_METHOD}" = "key" ]; then
+              SUDO() { sudo "$@"; }
+            else
+              SUDO() { echo "$PW" | sudo -S "$@"; }
+            fi
+            m "${{ env.PAW_M_cicd_ssh_auth }}" method="${SSH_AUTH_METHOD}"
+
+            BRANCH=${{ github.ref_name }}
+
+            PROJECT_NAME="${{ env.PROJECT_PATH != '.' && format('{0}-python', env.PROJECT_NAME) || env.PROJECT_NAME }}"
+
+            # Port and container name
+            PORT=${{ env.DEPLOY_PORT }}
+
+            if [ -z "${{ env.CONTAINER_NAME }}" ]; then
+              CONTAINER_NAME="${PROJECT_NAME}"
+              m "${{ env.PAW_M_cicd_container_default }}" container="$CONTAINER_NAME"
+            else
+              CONTAINER_NAME="${{ env.CONTAINER_NAME }}"
+              m "${{ env.PAW_M_cicd_container_custom }}" container="$CONTAINER_NAME"
+            fi
+
+            m "${{ env.PAW_M_cicd_deploy_start }}" branch="$BRANCH"
+
+            m "${{ env.PAW_M_cicd_config_title }}"
+            m "${{ env.PAW_M_cicd_config_branch }}" branch="$BRANCH"
+            m "${{ env.PAW_M_cicd_config_project }}" project="$PROJECT_NAME"
+            m "${{ env.PAW_M_cicd_config_container }}" container="$CONTAINER_NAME"
+            m "${{ env.PAW_M_cicd_config_port }}" port="$PORT"
+            m "${{ env.PAW_M_cicd_config_image }}" image="${{ secrets.DOCKERHUB_USERNAME }}/${PROJECT_NAME}:${BRANCH}"
+
+            # Pull the Docker image
+            m "${{ env.PAW_M_cicd_pull_image }}" image="${{ secrets.DOCKERHUB_USERNAME }}/${PROJECT_NAME}:${BRANCH}"
+            SUDO docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${PROJECT_NAME}:${BRANCH}
+
+            # Clean up the existing container
+            m "${{ env.PAW_M_cicd_container_check }}" container="$CONTAINER_NAME"
+
+            if SUDO docker ps -a --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}\$"; then
+              m "${{ env.PAW_M_cicd_container_exists }}" container="$CONTAINER_NAME"
+              SUDO docker rm -f $CONTAINER_NAME
+              m "${{ env.PAW_M_cicd_container_removed }}" container="$CONTAINER_NAME"
+            else
+              m "${{ env.PAW_M_cicd_container_none }}" container="$CONTAINER_NAME"
+            fi
+
+            # Start the new container
+            m "${{ env.PAW_M_cicd_container_run }}" container="$CONTAINER_NAME"
+
+            # The .env file is already baked into the Docker image
+
+            VOLUME_OPTS="-v /etc/localtime:/etc/localtime:ro"
+            if [ "${{ env.ENABLE_VOLUME_MOUNT }}" == "true" ]; then
+              if [ ! -d "${{ env.VOLUME_HOST_PATH }}" ]; then
+                m "${{ env.PAW_M_cicd_volume_mkdir }}" path="${{ env.VOLUME_HOST_PATH }}"
+                SUDO mkdir -p "${{ env.VOLUME_HOST_PATH }}"
+              fi
+              VOLUME_OPTS="$VOLUME_OPTS -v ${{ env.VOLUME_HOST_PATH }}:${{ env.VOLUME_CONTAINER_PATH }}"
+              m "${{ env.PAW_M_cicd_volume_on }}" opts="$VOLUME_OPTS"
+            else
+              m "${{ env.PAW_M_cicd_volume_off }}"
+            fi
+
+            SUDO docker run -d \
+              -p ${PORT}:${{ env.CONTAINER_INTERNAL_PORT }} \
+              --name $CONTAINER_NAME \
+              -e TZ=Asia/Seoul \
+              $VOLUME_OPTS \
+              ${{ secrets.DOCKERHUB_USERNAME }}/${PROJECT_NAME}:${BRANCH}
+
+            # Container health check
+            m "${{ env.PAW_M_cicd_health_wait }}" seconds="${{ env.HEALTHCHECK_WAIT_SECONDS }}"
+            sleep ${{ env.HEALTHCHECK_WAIT_SECONDS }}
+
+            # Step 1: check the container process
+            m "${{ env.PAW_M_cicd_health_check }}"
+            if ! SUDO docker ps --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}\$"; then
+              m "${{ env.PAW_M_cicd_health_no_process }}" container="$CONTAINER_NAME"
+              SUDO docker logs --tail 50 $CONTAINER_NAME || true
+              exit 1
+            fi
+            m "${{ env.PAW_M_cicd_health_process_ok }}"
+
+            # Step 2: check the HTTP endpoint (when configured)
+            HEALTHCHECK_SUCCESS=false
+            if [ -n "${{ env.HEALTHCHECK_PATH }}" ]; then
+              m "${{ env.PAW_M_cicd_http_start }}" url="http://localhost:${PORT}${{ env.HEALTHCHECK_PATH }}"
+
+              for i in $(seq 1 ${{ env.HEALTHCHECK_MAX_RETRIES }}); do
+                m "${{ env.PAW_M_cicd_http_try }}" i="$i" max="${{ env.HEALTHCHECK_MAX_RETRIES }}"
+
+                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:${PORT}${{ env.HEALTHCHECK_PATH }} || echo "000")
+
+                if [ "$HTTP_CODE" = "200" ]; then
+                  m "${{ env.PAW_M_cicd_http_ok }}" code="$HTTP_CODE"
+                  HEALTHCHECK_SUCCESS=true
+                  break
+                else
+                  m "${{ env.PAW_M_cicd_http_fail }}" code="$HTTP_CODE"
+                  if [ $i -lt ${{ env.HEALTHCHECK_MAX_RETRIES }} ]; then
+                    m "${{ env.PAW_M_cicd_http_retry }}" interval="${{ env.HEALTHCHECK_RETRY_INTERVAL }}"
+                    sleep ${{ env.HEALTHCHECK_RETRY_INTERVAL }}
+                  fi
+                fi
+              done
+
+              # If the HTTP check fails, fall back to log pattern matching
+              if [ "$HEALTHCHECK_SUCCESS" = "false" ]; then
+                m "${{ env.PAW_M_cicd_http_final_fail }}"
+              fi
+            else
+              m "${{ env.PAW_M_cicd_http_skipped }}"
+            fi
+
+            # Step 3: log pattern matching (when HTTP failed or the HTTP check is disabled)
+            if [ "$HEALTHCHECK_SUCCESS" = "false" ]; then
+              m "${{ env.PAW_M_cicd_log_start }}" pattern="${{ env.HEALTHCHECK_LOG_PATTERN }}"
+
+              if SUDO docker logs $CONTAINER_NAME 2>&1 | grep -q "${{ env.HEALTHCHECK_LOG_PATTERN }}"; then
+                m "${{ env.PAW_M_cicd_log_ok }}"
+                HEALTHCHECK_SUCCESS=true
+              else
+                m "${{ env.PAW_M_cicd_log_fail }}"
+                echo ""
+                m "${{ env.PAW_M_cicd_debug_title }}"
+                m "${{ env.PAW_M_cicd_debug_pattern }}" pattern="${{ env.HEALTHCHECK_LOG_PATTERN }}"
+                m "${{ env.PAW_M_cicd_debug_container }}" container="$CONTAINER_NAME"
+                m "${{ env.PAW_M_cicd_debug_image }}" image="${{ secrets.DOCKERHUB_USERNAME }}/${PROJECT_NAME}:${BRANCH}"
+                m "${{ env.PAW_M_cicd_debug_port }}" port="${PORT}:${{ env.CONTAINER_INTERNAL_PORT }}"
+                m "${{ env.PAW_M_cicd_debug_volume }}" volume="$VOLUME_OPTS"
+                echo ""
+                m "${{ env.PAW_M_cicd_debug_logs }}"
+                SUDO docker logs --tail 50 $CONTAINER_NAME || true
+                exit 1
+              fi
+            fi
+
+            if [ "$HEALTHCHECK_SUCCESS" = "true" ]; then
+              m "${{ env.PAW_M_cicd_health_done }}" container="$CONTAINER_NAME"
+            fi
+
+            m "${{ env.PAW_M_cicd_deploy_done }}"
+            echo ""
+            m "${{ env.PAW_M_cicd_summary_title }}"
+            m "${{ env.PAW_M_cicd_summary_project }}" project="$PROJECT_NAME"
+            m "${{ env.PAW_M_cicd_summary_branch }}" branch="$BRANCH"
+            m "${{ env.PAW_M_cicd_summary_container }}" container="$CONTAINER_NAME"
+            m "${{ env.PAW_M_cicd_summary_port }}" port="$PORT"
+            m "${{ env.PAW_M_cicd_summary_time }}" time="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            m "${{ env.PAW_M_cicd_summary_url }}" url="http://${{ secrets.SERVER_HOST }}:${PORT}/docs"

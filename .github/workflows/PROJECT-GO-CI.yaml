@@ -1,0 +1,137 @@
+# project-auto-wizard:managed-workflow
+# Go build verification workflow (CI only)
+# - Verifies with go build/vet/test/lint on push/PR to the develop branch
+# - Needs no Dockerfile, so it also works for Go projects that are not deployed (CLI tools, libraries, ...)
+# - Uses the go directive version from go.mod automatically (no hardcoded version)
+
+name: PROJECT-GO-CI
+
+on:
+  push:
+    branches:
+      - "develop"  # build verification on push to the develop branch
+  pull_request:
+    branches:
+      - "develop"  # build verification on PRs to the develop branch
+  workflow_dispatch:  # allow manual runs
+
+env:
+  # Unique project identifier
+  PROJECT_NAME: "project-auto-wizard-v4-ci-mono"
+  # Subdirectory of this project in a monorepo ('.' means always verify)
+  PROJECT_PATH: "go"
+
+jobs:
+  # Change detection (in a monorepo, checks whether this project's path changed)
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      project: ${{ steps.filter.outputs.project }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check whether the project path changed
+        id: filter
+        if: ${{ github.event_name != 'workflow_dispatch' }}
+        uses: dorny/paths-filter@v4
+        with:
+          # A push only looks at this push's range (against the previous commit, 'before'). Left empty it would be the cumulative diff against the default branch.
+          # The first push of a new branch (before is 0) and PRs get an empty value -> default behavior (against the default branch / PR base)
+          base: ${{ github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000' && github.event.before || '' }}
+          filters: |
+            project:
+              - '${{ env.PROJECT_PATH == '.' && '**' || format('{0}/**', env.PROJECT_PATH) }}'
+
+  # Job: build verification
+  build-check:
+    name: Go build verification
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.project == 'true' }}
+    # In a monorepo (--paths), build inside that subfolder
+    defaults:
+      run:
+        working-directory: ${{ env.PROJECT_PATH }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # A module without dependencies has no go.sum; caching against a missing file only makes setup-go warn
+      - name: Check for go.sum
+        id: gosum
+        run: echo "exists=$([ -f go.sum ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      # Automatically use the go directive version from go.mod
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: ${{ env.PROJECT_PATH }}/go.mod
+          cache-dependency-path: ${{ env.PROJECT_PATH }}/go.sum
+          cache: ${{ steps.gosum.outputs.exists == 'true' }}
+
+      - name: Verify go build
+        run: go build ./...
+
+      - name: Verify go vet
+        run: go vet ./...
+
+      - name: Run go test
+        run: go test ./...
+
+      # golangci-lint-action v7+ requires golangci-lint v2; if .golangci.yml is in the v1 format
+      # the project has to adjust it. version: latest picks up the newest v2 patch automatically
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+          working-directory: ${{ env.PROJECT_PATH }}
+
+      - name: Build verification complete
+        env:
+          PAW_REF_NAME: ${{ github.ref_name }}
+          # On a PR, github.sha is the temporary merge commit; show the PR head commit instead
+          PAW_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          m cibuild.go_done
+          echo ""
+          m cibuild.info_title
+          m cibuild.info_project project="${{ env.PROJECT_NAME }}"
+          m cibuild.info_branch branch="$PAW_REF_NAME"
+          m cibuild.info_commit sha="$(echo "$PAW_COMMIT_SHA" | cut -c1-7)"
+          m cibuild.info_time time="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+  # Job: CI Gate (the single job to register as a required check)
+  ci-gate:
+    name: CI Gate
+    if: ${{ always() }}
+    needs: [changes, build-check]
+    runs-on: ubuntu-latest
+    steps:
+      # Only the message catalog is needed here, so check out just that
+      - name: Checkout message catalog
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Aggregate results
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: |
+          [ -f "$GITHUB_WORKSPACE/.github/scripts/messages.py" ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          m() { (cd "$GITHUB_WORKSPACE" && python3 .github/scripts/messages.py get "$@"); }
+          m cibuild.gate_results results="$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"(failure|cancelled)"'; then
+            m cibuild.gate_failed
+            exit 1
+          fi

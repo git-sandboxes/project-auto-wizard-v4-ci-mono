@@ -1,0 +1,7 @@
+{
+  "name": "demo-react",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "build": "node build.js" },
+  "dependencies": { "react": "18.3.1" }
+}

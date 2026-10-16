@@ -1,0 +1,62 @@
+{
+  "templateVersion": "0.17.0",
+  "installedAt": "2026-10-16 05:06:07",
+  "files": {
+    "PROJECT-COMMON-AI-PR-SUMMARY.yaml": {
+      "installed": "sha256:19f828de5f1c5cb9e3510c42d258fdc5aa398d0164d1f8634f4785b6abc59fb4",
+      "rendered": "sha256:19f828de5f1c5cb9e3510c42d258fdc5aa398d0164d1f8634f4785b6abc59fb4"
+    },
+    "PROJECT-COMMON-AUTO-CHANGELOG-CONTROL.yaml": {
+      "installed": "sha256:799fc718f3ebf0fa0d521c7eb3a90c26df7eb69e3e4f2178495cde2159795f72",
+      "rendered": "sha256:799fc718f3ebf0fa0d521c7eb3a90c26df7eb69e3e4f2178495cde2159795f72"
+    },
+    "PROJECT-COMMON-ISSUE-HELPER.yaml": {
+      "installed": "sha256:846a177deae41e160eccb21fa66b95a6ccb593286c526832f2662b8e6e00b262",
+      "rendered": "sha256:846a177deae41e160eccb21fa66b95a6ccb593286c526832f2662b8e6e00b262"
+    },
+    "PROJECT-COMMON-README-VERSION-UPDATE.yaml": {
+      "installed": "sha256:b1b23fa86b7b6d6f1cacc256abcd8b8f2d46cee46012e1f361289b46d7940cb9",
+      "rendered": "sha256:b1b23fa86b7b6d6f1cacc256abcd8b8f2d46cee46012e1f361289b46d7940cb9"
+    },
+    "PROJECT-COMMON-RELEASE-PUBLISH.yaml": {
+      "installed": "sha256:963b3e0cc7e2c01ff2edcd6ee8f840fd8337f9215f61c810a4ff545767359a87",
+      "rendered": "sha256:963b3e0cc7e2c01ff2edcd6ee8f840fd8337f9215f61c810a4ff545767359a87"
+    },
+    "PROJECT-COMMON-VERSION-CONTROL.yaml": {
+      "installed": "sha256:53d0d86cd2fc029e1d0110e3bc86a560b82b531dd86ce900608c50edffc6006e",
+      "rendered": "sha256:53d0d86cd2fc029e1d0110e3bc86a560b82b531dd86ce900608c50edffc6006e"
+    },
+    "PROJECT-GO-CI.yaml": {
+      "installed": "sha256:85a815c8beb6d9321fc02743129c13872f5f7cda8e8ba621f8c67cf808e95608",
+      "rendered": "sha256:85a815c8beb6d9321fc02743129c13872f5f7cda8e8ba621f8c67cf808e95608"
+    },
+    "PROJECT-GO-PR-PREVIEW.yaml": {
+      "installed": "sha256:d93aeda3e102ced8b78db7d454a5a64dde994ee335d84c470451c0cc464bb453",
+      "rendered": "sha256:d93aeda3e102ced8b78db7d454a5a64dde994ee335d84c470451c0cc464bb453"
+    },
+    "PROJECT-GO-SIMPLE-CICD.yaml": {
+      "installed": "sha256:bba999156c6b22b75564c863b924d583a3cec6a5637f38e77f669cb356a26a78",
+      "rendered": "sha256:bba999156c6b22b75564c863b924d583a3cec6a5637f38e77f669cb356a26a78"
+    },
+    "PROJECT-PYTHON-CI.yaml": {
+      "installed": "sha256:227580d354355ba8b4826724675e624a123d48037aacd28be9ad78e1acef024d",
+      "rendered": "sha256:227580d354355ba8b4826724675e624a123d48037aacd28be9ad78e1acef024d"
+    },
+    "PROJECT-PYTHON-PR-PREVIEW.yaml": {
+      "installed": "sha256:c733951a57e848b2d47865eaaeed6d59e650de9368e28e42984f4c21f9ae2471",
+      "rendered": "sha256:c733951a57e848b2d47865eaaeed6d59e650de9368e28e42984f4c21f9ae2471"
+    },
+    "PROJECT-PYTHON-SIMPLE-CICD.yaml": {
+      "installed": "sha256:a6446d76fa5b1d6a8173e68dac69d4bea3037a1a71f3d4c15bf226ab23c63695",
+      "rendered": "sha256:a6446d76fa5b1d6a8173e68dac69d4bea3037a1a71f3d4c15bf226ab23c63695"
+    },
+    "PROJECT-REACT-CI.yaml": {
+      "installed": "sha256:5312503a5ef59d31ddac704402ef7a564b4658dce0593d6790f3e9be87744955",
+      "rendered": "sha256:5312503a5ef59d31ddac704402ef7a564b4658dce0593d6790f3e9be87744955"
+    },
+    "PROJECT-REACT-CICD.yaml": {
+      "installed": "sha256:1cd9ddcb1f0b66770457108d80e719df281fadb59b1ae16696a57914cdde2078",
+      "rendered": "sha256:1cd9ddcb1f0b66770457108d80e719df281fadb59b1ae16696a57914cdde2078"
+    }
+  }
+}

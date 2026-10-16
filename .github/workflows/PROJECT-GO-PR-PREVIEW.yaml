@@ -1,0 +1,2945 @@
+# project-auto-wizard:managed-workflow
+# Go PR Preview (SSH + Docker + Traefik)
+# Manages the preview environment automatically through PR or issue comment commands. Routing is dynamic via the Traefik reverse proxy.
+#
+# Required GitHub Secrets
+# ENV_FILE: full contents of the .env file
+# DOCKERHUB_USERNAME / DOCKERHUB_TOKEN: Docker Hub username / access token
+# SERVER_HOST / SERVER_USER: server host (SSH address) / SSH username
+# SERVER_PASSWORD: SSH password (when SSH_AUTH_METHOD=password)
+# SSH_KEY: contents of the SSH private key .pem (when SSH_AUTH_METHOD=key, e.g. AWS EC2)
+#
+# Usage
+# /wizard server build    - Build and deploy the preview
+# /wizard server destroy  - Delete the preview environment
+# /wizard server status   - Check the current status
+#
+# Resource naming
+# - Container: {PROJECT_NAME}-pr-{number}
+# - Domain: {PROJECT_NAME}-pr-{number}.pr.example.com
+#
+# Prerequisites
+# - Traefik container running (traefik-network)
+# - Wildcard DNS: *.pr.example.com → server
+
+name: PROJECT-GO-PR-PREVIEW
+
+# [Section 1] Project settings - when reusing this in another project, edit only this section
+env:
+  # Unique project identifier (used in container, image and domain names)
+  PROJECT_NAME: "project-auto-wizard-v4-ci-mono"
+  # Subdirectory of this project in a monorepo (--paths). Base for the build and Docker context ('.' means the repo root)
+  PROJECT_PATH: "go"
+  # In a monorepo (PROJECT_PATH is not '.') '-go' is appended to image, container and domain names
+  # so they do not collide with services of other types in the same repo (e.g. my-app-go)
+
+  # Docker settings
+  DOCKERFILE_PATH: './Dockerfile'  # path relative to PROJECT_PATH
+  INTERNAL_PORT: '8080'
+
+  # Volume mount settings (edit per project; leave empty to skip mounting)
+  PROJECT_TARGET_DIR: "/volume1/projects/project-auto-wizard-v4-ci-mono"
+  PROJECT_MNT_DIR: "/mnt/project-auto-wizard-v4-ci-mono"
+
+  # Traefik & preview domain settings (do not change after the environment is set up)
+  TRAEFIK_NETWORK: traefik-network
+  PREVIEW_DOMAIN_SUFFIX: "pr.example.com"
+  PREVIEW_PORT: '8079'
+
+  # SSH auth method: "password" (Synology / regular servers) | "key" (AWS EC2 / .pem)
+  #   password → uses the SERVER_PASSWORD secret
+  #   key      → uses the SSH_KEY secret (store the whole .pem contents as the secret value)
+  SSH_AUTH_METHOD: "password"
+
+  # SSH port (do not change after the server port is set up)
+  SSH_PORT: "2022"
+
+  # Issue Helper comment marker (edit per project)
+  # Used to extract the branch name from an issue comment
+  ISSUE_HELPER_MARKER: '<!-- project-auto-wizard issue helper -->'
+
+  # Health check settings (edit per project)
+  # - HEALTH_CHECK_PATH: HTTP health check path (empty skips the HTTP check)
+  # - HEALTH_CHECK_LOG_PATTERN: log pattern match (fallback when HTTP fails)
+  # - API_DOCS_PATH: API docs URL (empty hides it from the deploy comment)
+  #
+  # Default examples per framework:
+  #   FastAPI: '/docs', 'Uvicorn running on|Application startup complete'
+  #   Spring Boot: '/actuator/health', 'Started.*Application|Tomcat started on port'
+  #   Express: '/health', 'Server listening on port'
+  #   Go (net/http, etc.): '/health', 'listening on'
+  HEALTH_CHECK_PATH: '/health'
+  HEALTH_CHECK_LOG_PATTERN: 'listening on'
+  API_DOCS_PATH: ''
+
+on:
+  issue_comment:
+    types: [created]      # PR comments + issue comments
+  issues:
+    types: [closed]       # destroy when the issue is closed
+  pull_request:
+    types: [closed]       # destroy when the PR is closed
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  # Job 1: parse the command (supports both PR and issue comments)
+  check-command:
+    name: Check command
+    if: github.event_name == 'issue_comment'
+    runs-on: ubuntu-latest
+    outputs:
+      command: ${{ steps.parse.outputs.command }}
+      is_valid: ${{ steps.parse.outputs.is_valid }}
+      is_pr: ${{ steps.parse.outputs.is_pr }}
+      custom_branch: ${{ steps.parse.outputs.custom_branch }}
+      is_custom_branch: ${{ steps.parse.outputs.is_custom_branch }}
+    steps:
+      # Messages come from the same revision as this workflow (the PR merge commit on pull_request, otherwise the
+      # default branch) so they exist even before the default branch has them, and before the PR branch is checked out
+      - name: Checkout messages
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+          # Separate path: a sparse checkout at the workspace root would leave the later full checkout sparse too
+          path: .paw-msg
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        run: |
+          # Keep a copy outside the workspace and drop the sparse clone so the later checkout sees a clean tree
+          mkdir -p "$RUNNER_TEMP/paw"
+          [ -f .paw-msg/.github/scripts/messages.py ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          cp .paw-msg/.github/scripts/messages.py "$RUNNER_TEMP/paw/messages.py"
+          LANG_CODE=$(cd .paw-msg && python3 "$RUNNER_TEMP/paw/messages.py" lang)
+          rm -rf .paw-msg
+          # The workspace root has no version.yml; pass the language resolved above to every later messages.py call
+          export PROJECT_AUTO_WIZARD_LANG="$LANG_CODE"
+          python3 "$RUNNER_TEMP/paw/messages.py" dump wf_preview. > "$RUNNER_TEMP/paw-msg.json"
+          echo "PROJECT_AUTO_WIZARD_LANG=$LANG_CODE" >> "$GITHUB_ENV"
+
+      - name: Add 👀 reaction to comment
+        if: contains(github.event.comment.body, '/wizard') && contains(github.event.comment.body, 'server')
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+      - name: Parse command
+        id: parse
+        env:
+          COMMENT: ${{ github.event.comment.body }}
+          IS_PR: ${{ github.event.issue.pull_request != null }}
+        run: |
+          m() { python3 "$RUNNER_TEMP/paw/messages.py" get "$@"; }
+
+          # Check whether this is a PR or an issue
+          if [[ "$IS_PR" == "true" ]]; then
+            echo "is_pr=true" >> $GITHUB_OUTPUT
+            m wf_preview.cmd_from_pr
+          else
+            echo "is_pr=false" >> $GITHUB_OUTPUT
+            m wf_preview.cmd_from_issue
+          fi
+
+          # Parse the command (branch argument supported)
+          # Format: /wizard server <command> [branch]
+          if [[ "$COMMENT" =~ /wizard[[:space:]]+server[[:space:]]+build([[:space:]]+([^[:space:]]+))? ]]; then
+            echo "command=build" >> $GITHUB_OUTPUT
+            echo "is_valid=true" >> $GITHUB_OUTPUT
+            if [[ -n "${BASH_REMATCH[2]}" ]]; then
+              echo "custom_branch=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+              echo "is_custom_branch=true" >> $GITHUB_OUTPUT
+              m wf_preview.cmd_detected_build_branch branch="${BASH_REMATCH[2]}"
+            else
+              echo "is_custom_branch=false" >> $GITHUB_OUTPUT
+              m wf_preview.cmd_detected_build
+            fi
+          elif [[ "$COMMENT" =~ /wizard[[:space:]]+server[[:space:]]+destroy([[:space:]]+([^[:space:]]+))? ]]; then
+            echo "command=destroy" >> $GITHUB_OUTPUT
+            echo "is_valid=true" >> $GITHUB_OUTPUT
+            if [[ -n "${BASH_REMATCH[2]}" ]]; then
+              echo "custom_branch=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+              echo "is_custom_branch=true" >> $GITHUB_OUTPUT
+              m wf_preview.cmd_detected_destroy_branch branch="${BASH_REMATCH[2]}"
+            else
+              echo "is_custom_branch=false" >> $GITHUB_OUTPUT
+              m wf_preview.cmd_detected_destroy
+            fi
+          elif [[ "$COMMENT" =~ /wizard[[:space:]]+server[[:space:]]+status([[:space:]]+([^[:space:]]+))? ]]; then
+            echo "command=status" >> $GITHUB_OUTPUT
+            echo "is_valid=true" >> $GITHUB_OUTPUT
+            if [[ -n "${BASH_REMATCH[2]}" ]]; then
+              echo "custom_branch=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+              echo "is_custom_branch=true" >> $GITHUB_OUTPUT
+              m wf_preview.cmd_detected_status_branch branch="${BASH_REMATCH[2]}"
+            else
+              echo "is_custom_branch=false" >> $GITHUB_OUTPUT
+              m wf_preview.cmd_detected_status
+            fi
+          else
+            echo "is_valid=false" >> $GITHUB_OUTPUT
+            m wf_preview.cmd_not_wizard
+          fi
+
+  # Job 2-1: build & deploy (triggered from a PR comment)
+  build-preview-pr:
+    name: Preview build & deploy (PR)
+    needs: check-command
+    if: |
+      needs.check-command.outputs.is_valid == 'true' &&
+      needs.check-command.outputs.command == 'build' &&
+      needs.check-command.outputs.is_pr == 'true' &&
+      needs.check-command.outputs.is_custom_branch != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Messages come from the same revision as this workflow (the PR merge commit on pull_request, otherwise the
+      # default branch) so they exist even before the default branch has them, and before the PR branch is checked out
+      - name: Checkout messages
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+          # Separate path: a sparse checkout at the workspace root would leave the later full checkout sparse too
+          path: .paw-msg
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        id: load_messages
+        run: |
+          # Keep a copy outside the workspace and drop the sparse clone so the later checkout sees a clean tree
+          mkdir -p "$RUNNER_TEMP/paw"
+          [ -f .paw-msg/.github/scripts/messages.py ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          cp .paw-msg/.github/scripts/messages.py "$RUNNER_TEMP/paw/messages.py"
+          LANG_CODE=$(cd .paw-msg && python3 "$RUNNER_TEMP/paw/messages.py" lang)
+          rm -rf .paw-msg
+          # The workspace root has no version.yml; pass the language resolved above to every later messages.py call
+          export PROJECT_AUTO_WIZARD_LANG="$LANG_CODE"
+          python3 "$RUNNER_TEMP/paw/messages.py" dump wf_preview. > "$RUNNER_TEMP/paw-msg.json"
+          echo "PROJECT_AUTO_WIZARD_LANG=$LANG_CODE" >> "$GITHUB_ENV"
+          # The deploy script runs on the remote server, where messages.py does not exist:
+          # ship the messages it needs as a small shell function (m KEY name=value ...)
+          python3 - >> "$GITHUB_ENV" <<'PY'
+          import json, os, shlex, subprocess
+          script = os.path.join(os.environ["RUNNER_TEMP"], "paw", "messages.py")
+          msgs = json.loads(subprocess.check_output(["python3", script, "dump", "wf_preview.r_"], text=True))
+          head = ["m() {", '  case "$1" in']
+          for key, text in msgs.items():
+              head.append("    %s) _t=%s ;;" % (key, shlex.quote(text)))
+          tail = r'''    *) _t="$1" ;;
+            esac
+            shift
+            while [ "$#" -gt 0 ]; do
+              _v=$(printf '%s' "${1#*=}" | sed 's/[\\&|]/\\&/g')
+              _t=$(printf '%s' "$_t" | sed "s|{${1%%=*}}|$_v|g")
+              shift
+            done
+            printf '%s\n' "$_t"
+          }'''
+          print("PAW_REMOTE<<PAW_EOF")
+          print("\n".join(head) + "\n" + tail)
+          print("PAW_EOF")
+          PY
+
+      - name: Get PR info
+        id: pr
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            core.setOutput('ref', pr.data.head.ref);
+            core.setOutput('sha', pr.data.head.sha.substring(0, 7));
+            return pr.data.number;
+
+      # Progress comment system
+      - name: Create progress comment
+        id: progress
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const prNumber = context.issue.number;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const startTime = Date.now();
+
+            const body = [
+              m('wf_preview.title_pr_building'),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_progress'),
+              m('wf_preview.row_deploy_wait'),
+              '',
+              m('wf_preview.link_logs', {runUrl}),
+              '',
+              '---',
+              m('wf_preview.footer_progress')
+            ].join('\n');
+
+            const { data: comment } = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: body
+            });
+
+            core.setOutput('comment_id', comment.id);
+            core.setOutput('start_time', startTime);
+            core.setOutput('docker_start', startTime);
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.pr.outputs.ref }}
+
+      # If a required secret or the Dockerfile is missing, report the missing items and stop instead of surfacing a third-party error such as a docker login failure
+      - name: Deploy pre-check (Secrets and Dockerfile)
+        id: precheck
+        working-directory: ${{ env.PROJECT_PATH }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          DOCKERFILE: ${{ env.DOCKERFILE_PATH }}
+        run: |
+          m() { python3 "$RUNNER_TEMP/paw/messages.py" get "$@"; }
+
+          MISSING=""
+          for NAME in DOCKERHUB_USERNAME DOCKERHUB_TOKEN SERVER_HOST SERVER_USER; do
+            [ -n "${!NAME}" ] || MISSING="$MISSING $NAME"
+          done
+          # SSH_KEY is required when SSH_AUTH_METHOD=key, otherwise SERVER_PASSWORD
+          if [ "${SSH_AUTH_METHOD:-password}" = "key" ]; then
+            [ -n "$SSH_KEY" ] || MISSING="$MISSING SSH_KEY"
+          else
+            [ -n "$SERVER_PASSWORD" ] || MISSING="$MISSING SERVER_PASSWORD"
+          fi
+          FAILED=false
+          ITEMS=""
+          if [ -n "$MISSING" ]; then
+            echo "::error title=$(m wf_preview.precheck_secret_title)::$(m wf_preview.precheck_secret_body missing="$MISSING")"
+            ITEMS="${MISSING# }"
+            ITEMS="${ITEMS// /, }"
+            FAILED=true
+          fi
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "::error title=$(m wf_preview.precheck_dockerfile_title)::$(m wf_preview.precheck_dockerfile_body path="${PROJECT_PATH}/${DOCKERFILE#./}")"
+            ITEMS="${ITEMS:+$ITEMS, }Dockerfile"
+            FAILED=true
+          fi
+          if [ "$FAILED" = "true" ]; then
+            # The failure comment names what blocked the later steps instead of showing them as waiting
+            echo "missing=$ITEMS" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          m wf_preview.precheck_ok
+
+      # [Section 2] Create the environment file
+      - name: "[Required] Create .env file"
+        working-directory: ${{ env.PROJECT_PATH }}
+        run: |
+          cat << 'EOF' > .env
+          ${{ secrets.ENV_FILE }}
+          EOF
+      # [End of section 2] Create the environment file
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build & push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.PROJECT_PATH }}
+          file: ${{ env.PROJECT_PATH }}/${{ env.DOCKERFILE_PATH }}
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}:pr-${{ github.event.issue.number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Progress - Docker done
+        id: docker_progress
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID: ${{ steps.progress.outputs.comment_id }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_DOCKER_START: ${{ steps.progress.outputs.docker_start }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const commentId = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID, 10) || 0;
+            const dockerStart = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_DOCKER_START, 10) || Date.now();
+            const now = Date.now();
+            const dockerElapsed = now - dockerStart;
+            const minutes = Math.floor(dockerElapsed / 60000);
+            const seconds = Math.floor((dockerElapsed % 60000) / 1000);
+            const dockerDuration = minutes > 0 ? m('wf_preview.dur_min_sec', {minutes, seconds}) : m('wf_preview.dur_sec', {seconds});
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const body = [
+              m('wf_preview.title_pr_building'),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_done', {dockerDuration}),
+              m('wf_preview.row_deploy_progress'),
+              '',
+              m('wf_preview.link_logs', {runUrl}),
+              '',
+              '---',
+              m('wf_preview.footer_progress')
+            ].join('\n');
+
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: commentId,
+              body: body
+            });
+
+            core.setOutput('docker_duration', dockerDuration);
+            core.setOutput('deploy_start', now);
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SSH_AUTH_METHOD: ${{ env.SSH_AUTH_METHOD }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          envs: SSH_AUTH_METHOD
+          script: |
+            ${{ env.PAW_REMOTE }}
+
+            set -e
+
+            export PATH=$PATH:/usr/local/bin
+            export PW="${{ secrets.SERVER_PASSWORD }}"
+
+            # sudo wrapper that depends on the SSH auth method
+            SSH_AUTH_METHOD="${SSH_AUTH_METHOD:-password}"
+            if [ "${SSH_AUTH_METHOD}" = "key" ]; then
+              SUDO() { sudo "$@"; }
+            else
+              SUDO() { echo "$PW" | sudo -S "$@"; }
+            fi
+            m wf_preview.r_ssh_auth ssh_auth_method="${SSH_AUTH_METHOD}"
+
+            PR_NUMBER=${{ github.event.issue.number }}
+            PROJECT_NAME="${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}"
+            CONTAINER_NAME="${PROJECT_NAME}-pr-${PR_NUMBER}"
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${PROJECT_NAME}:pr-${PR_NUMBER}"
+            DOMAIN="${PROJECT_NAME}-pr-${PR_NUMBER}.${{ env.PREVIEW_DOMAIN_SUFFIX }}"
+            INTERNAL_PORT="${{ env.INTERNAL_PORT }}"
+            TRAEFIK_NETWORK="${{ env.TRAEFIK_NETWORK }}"
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_deploy_head_pr
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_project_name project_name="${PROJECT_NAME}"
+            m wf_preview.r_num_pr pr_number="${PR_NUMBER}"
+            m wf_preview.r_container_name container_name="${CONTAINER_NAME}"
+            m wf_preview.r_domain domain="${DOMAIN}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            m wf_preview.r_image_pulling
+            SUDO docker pull "${IMAGE}"
+
+            m wf_preview.r_existing_cleanup
+            SUDO docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+
+            VOLUME_OPTS="-v /etc/localtime:/etc/localtime:ro"
+            if [ -n "${{ env.PROJECT_TARGET_DIR }}" ] && [ -n "${{ env.PROJECT_MNT_DIR }}" ]; then
+              VOLUME_OPTS="$VOLUME_OPTS -v ${{ env.PROJECT_TARGET_DIR }}:${{ env.PROJECT_MNT_DIR }}"
+            fi
+
+            m wf_preview.r_container_starting
+            SUDO docker run -d \
+              --name "${CONTAINER_NAME}" \
+              --network "${TRAEFIK_NETWORK}" \
+              --label "traefik.enable=true" \
+              --label "traefik.http.routers.${CONTAINER_NAME}.rule=Host(\`${DOMAIN}\`)" \
+              --label "traefik.http.routers.${CONTAINER_NAME}.entrypoints=web" \
+              --label "traefik.http.services.${CONTAINER_NAME}.loadbalancer.server.port=${INTERNAL_PORT}" \
+              -e TZ=Asia/Seoul \
+              -e ENVIRONMENT=prod \
+              $VOLUME_OPTS \
+              "${IMAGE}"
+
+            # Health check (waits up to 120s) - hybrid approach
+            # 1. Try the HTTP check when HEALTH_CHECK_PATH is set
+            # 2. Fallback: log pattern match (HEALTH_CHECK_LOG_PATTERN)
+            echo ""
+            m wf_preview.r_hc_start
+            HEALTH_PATH="${{ env.HEALTH_CHECK_PATH }}"
+            LOG_PATTERN="${{ env.HEALTH_CHECK_LOG_PATTERN }}"
+            MAX_RETRIES=24
+            RETRY_COUNT=0
+            HEALTH_CHECK_PASSED=false
+            HEALTH_CHECK_METHOD=""
+
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              sleep 5
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+
+              # 1. Check the container state
+              STATUS=$(SUDO docker inspect --format='{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || echo "not_found")
+
+              if [ "$STATUS" = "exited" ]; then
+                m wf_preview.r_container_exited
+                echo ""
+                m wf_preview.r_container_logs
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                SUDO docker logs --tail 100 "${CONTAINER_NAME}"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                exit 1
+              fi
+
+              if [ "$STATUS" = "running" ]; then
+                # 2. Try the HTTP health check (only when HEALTH_CHECK_PATH is set)
+                if [ -n "$HEALTH_PATH" ]; then
+                  HEALTH=$(SUDO docker exec "${CONTAINER_NAME}" curl -sf "http://localhost:${INTERNAL_PORT}${HEALTH_PATH}" 2>/dev/null || echo "")
+
+                  if [ -n "$HEALTH" ]; then
+                    m wf_preview.r_hc_ok_http health_path="${HEALTH_PATH}"
+                    HEALTH_CHECK_PASSED=true
+                    HEALTH_CHECK_METHOD="HTTP"
+                    break
+                  fi
+                fi
+
+                # 3. Without an HTTP response, fall back to log pattern matching
+                if [ -n "$LOG_PATTERN" ]; then
+                  STARTED=$(SUDO docker logs --tail 50 "${CONTAINER_NAME}" 2>&1 | grep -E "$LOG_PATTERN" || echo "")
+
+                  if [ -n "$STARTED" ]; then
+                    m wf_preview.r_hc_ok_log
+                    echo "   $STARTED"
+                    HEALTH_CHECK_PASSED=true
+                    HEALTH_CHECK_METHOD="Log"
+                    break
+                  fi
+                fi
+              fi
+
+              m wf_preview.r_hc_waiting retry_count="$RETRY_COUNT" max_retries="$MAX_RETRIES" status="$STATUS"
+            done
+
+            if [ "$HEALTH_CHECK_PASSED" = "false" ]; then
+              echo ""
+              m wf_preview.r_hc_timeout
+              echo ""
+              m wf_preview.r_container_logs
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              SUDO docker logs --tail 100 "${CONTAINER_NAME}"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              exit 1
+            fi
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_hc_done health_check_method="${HEALTH_CHECK_METHOD}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: Deploy complete comment
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION: ${{ steps.docker_progress.outputs.docker_duration }}
+          PAW_IN_STEPS_PR_OUTPUTS_REF: ${{ steps.pr.outputs.ref }}
+          PAW_IN_STEPS_PR_OUTPUTS_SHA: ${{ steps.pr.outputs.sha }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID: ${{ steps.progress.outputs.comment_id }}
+          PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DEPLOY_START: ${{ steps.docker_progress.outputs.deploy_start }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const commentId = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID, 10) || 0;
+            const dockerDuration = process.env.PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION;
+            const deployStart = parseInt(process.env.PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DEPLOY_START, 10) || Date.now();
+            const now = Date.now();
+            const deployElapsed = now - deployStart;
+            const minutes = Math.floor(deployElapsed / 60000);
+            const seconds = Math.floor((deployElapsed % 60000) / 1000);
+            const deployDuration = minutes > 0 ? m('wf_preview.dur_min_sec', {minutes, seconds}) : m('wf_preview.dur_sec', {seconds});
+
+            const projectName = process.env.PROJECT_PATH !== '.' ? process.env.PROJECT_NAME + '-go' : process.env.PROJECT_NAME;
+            const domainSuffix = process.env.PREVIEW_DOMAIN_SUFFIX;
+            const previewPort = process.env.PREVIEW_PORT;
+            const apiDocsPath = process.env.API_DOCS_PATH;
+            const prNumber = context.issue.number;
+            const domain = `${projectName}-pr-${prNumber}.${domainSuffix}`;
+            const previewUrl = `http://${domain}:${previewPort}`;
+            const sha = process.env.PAW_IN_STEPS_PR_OUTPUTS_SHA;
+
+            // Build the preview environment table (the API Docs row is added only when API_DOCS_PATH is set)
+            const envRows = [
+              `| **Preview URL** | ${previewUrl} |`,
+            ];
+            if (apiDocsPath) {
+              envRows.push(`| **API Docs** | ${previewUrl}${apiDocsPath} |`);
+            }
+            envRows.push(m('wf_preview.env_container_pr', {projectName, prNumber}));
+            envRows.push(m('wf_preview.env_commit', {sha}));
+
+            const branchName = process.env.PAW_IN_STEPS_PR_OUTPUTS_REF;
+
+            const body = [
+              m('wf_preview.title_pr_deployed'),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_done', {dockerDuration}),
+              m('wf_preview.row_deploy_done', {deployDuration}),
+              '',
+              m('wf_preview.sec_env'),
+              m('wf_preview.tbl_items'),
+              '|------|-----|',
+              ...envRows,
+              '',
+              m('wf_preview.sec_commands'),
+              m('wf_preview.tbl_commands'),
+              '|--------|------|',
+              m('wf_preview.cmd_build'),
+              m('wf_preview.cmd_destroy'),
+              m('wf_preview.cmd_status'),
+              '',
+              '<details>',
+              m('wf_preview.cmd_advanced'),
+              '',
+              '```',
+              `/wizard server build ${branchName}`,
+              `/wizard server destroy ${branchName}`,
+              `/wizard server status ${branchName}`,
+              '```',
+              '</details>',
+              '',
+              '---',
+              m('wf_preview.footer_pr')
+            ].join('\n');
+
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: commentId,
+              body: body
+            });
+
+      - name: Build/deploy failure comment
+        if: failure() && steps.load_messages.outcome == 'success'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION: ${{ steps.docker_progress.outputs.docker_duration }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID: ${{ steps.progress.outputs.comment_id }}
+          PAW_IN_STEPS_PRECHECK_OUTCOME: ${{ steps.precheck.outcome }}
+          PAW_IN_STEPS_PRECHECK_OUTPUTS_MISSING: ${{ steps.precheck.outputs.missing }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const commentId = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID, 10) || 0;
+            const projectName = process.env.PROJECT_PATH !== '.' ? process.env.PROJECT_NAME + '-go' : process.env.PROJECT_NAME;
+            const prNumber = context.issue.number;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // Show where it failed based on progress
+            const dockerDuration = process.env.PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION;
+
+            // Work out where it failed - early-stage failures are distinguished too
+            let dockerStatus, deployStatus;
+            let dockerTime = '-';
+
+            if (!commentId) {
+              // Failed before the progress comment was created (initialization stage)
+              dockerStatus = m('wf_preview.status_init_failed');
+              deployStatus = '-';
+            } else if (process.env.PAW_IN_STEPS_PRECHECK_OUTCOME === 'failure') {
+              // The pre-check stopped the run before any build step: say why nothing ran
+              dockerStatus = deployStatus = m('wf_preview.status_precheck_blocked', { missing: process.env.PAW_IN_STEPS_PRECHECK_OUTPUTS_MISSING || '-' });
+            } else if (!dockerDuration || dockerDuration === '') {
+              // Failed at the Docker build stage; the deploy step never ran
+              dockerStatus = m('wf_preview.status_failed');
+              deployStatus = m('wf_preview.status_not_run');
+            } else {
+              // Failed at the deploy stage
+              dockerStatus = m('wf_preview.status_done');
+              deployStatus = m('wf_preview.status_failed');
+              dockerTime = dockerDuration;
+            }
+
+            const body = [
+              m('wf_preview.title_pr_failed'),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_status', {dockerStatus, dockerTime}),
+              m('wf_preview.row_deploy_status', {deployStatus}),
+              '',
+              m('wf_preview.link_build_logs', {runUrl}),
+              '',
+              m('wf_preview.sec_causes'),
+              m('wf_preview.hint_secrets'),
+              m('wf_preview.hint_docker_go'),
+              m('wf_preview.hint_start_go'),
+              m('wf_preview.hint_health_timeout'),
+              m('wf_preview.hint_env_missing'),
+              '',
+              m('wf_preview.sec_next'),
+              m('wf_preview.next_logs'),
+              m('wf_preview.next_retry'),
+              '',
+              '---',
+              m('wf_preview.footer_pr')
+            ].join('\n');
+
+            // Update the progress comment if it exists, otherwise create a new one
+            if (commentId) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: commentId,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: body
+              });
+            }
+
+  # Job 2-2: extract the branch name from the issue
+  get-branch-from-issue:
+    name: Extract branch from issue
+    needs: check-command
+    if: |
+      needs.check-command.outputs.is_valid == 'true' &&
+      needs.check-command.outputs.is_pr == 'false' &&
+      needs.check-command.outputs.is_custom_branch != 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      branch_name: ${{ steps.extract.outputs.branch }}
+      found: ${{ steps.extract.outputs.found }}
+      issue_number: ${{ steps.extract.outputs.issue_number }}
+    steps:
+      # Messages come from the same revision as this workflow (the PR merge commit on pull_request, otherwise the
+      # default branch) so they exist even before the default branch has them, and before the PR branch is checked out
+      - name: Checkout messages
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+          # Separate path: a sparse checkout at the workspace root would leave the later full checkout sparse too
+          path: .paw-msg
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        run: |
+          # Keep a copy outside the workspace and drop the sparse clone so the later checkout sees a clean tree
+          mkdir -p "$RUNNER_TEMP/paw"
+          [ -f .paw-msg/.github/scripts/messages.py ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          cp .paw-msg/.github/scripts/messages.py "$RUNNER_TEMP/paw/messages.py"
+          LANG_CODE=$(cd .paw-msg && python3 "$RUNNER_TEMP/paw/messages.py" lang)
+          rm -rf .paw-msg
+          # The workspace root has no version.yml; pass the language resolved above to every later messages.py call
+          export PROJECT_AUTO_WIZARD_LANG="$LANG_CODE"
+          python3 "$RUNNER_TEMP/paw/messages.py" dump wf_preview. > "$RUNNER_TEMP/paw-msg.json"
+          echo "PROJECT_AUTO_WIZARD_LANG=$LANG_CODE" >> "$GITHUB_ENV"
+
+      - name: Extract branch name from issue comment
+        id: extract
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const issueNumber = context.issue.number;
+            const marker = process.env.ISSUE_HELPER_MARKER;
+
+            console.log(m('wf_preview.log_search_branch', {issueNumber}));
+            console.log(m('wf_preview.log_marker', {marker}));
+
+            // Fetch all comments of the issue
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber
+            });
+
+            // Branch extraction pattern (same format regardless of the marker)
+            // Match the issue helper heading in either language: "### Branch name" (en) or the Korean "### \uBE0C\uB79C\uCE58(\uBA85)" (ko)
+            const branchRegex = /###\s*(?:\uBE0C\uB79C\uCE58(?:\uBA85)?|Branch(?: name)?)\s*\n```\s*\n([^\n]+)\s*\n```/i;
+
+            for (const comment of comments.data) {
+              // Find comments that contain the marker
+              if (comment.body.includes(marker)) {
+                const match = comment.body.match(branchRegex);
+                if (match) {
+                  const branchName = match[1].trim();
+                  core.setOutput('branch', branchName);
+                  core.setOutput('found', 'true');
+                  core.setOutput('issue_number', issueNumber);
+                  console.log(m('wf_preview.log_branch_found', {branchName}));
+                  return;
+                }
+              }
+            }
+
+            // Branch not found - not an error, handle it gracefully
+            core.setOutput('found', 'false');
+            core.setOutput('issue_number', issueNumber);
+            console.log(m('wf_preview.log_helper_no_branch'));
+
+      - name: Branch not found notice
+        if: steps.extract.outputs.found == 'false'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const issueNumber = context.issue.number;
+            const marker = process.env.ISSUE_HELPER_MARKER;
+
+            const body = [
+              m('wf_preview.title_branch_missing_warn'),
+              '',
+              m('wf_preview.tbl_items'),
+              '|------|-----|',
+              `| **Issue** | #${issueNumber} |`,
+              m('wf_preview.env_marker', {marker}),
+              '',
+              m('wf_preview.sec_check'),
+              m('wf_preview.chk_helper_exists'),
+              m('wf_preview.chk_helper_section'),
+              m('wf_preview.chk_helper_marker'),
+              '',
+              '---',
+              m('wf_preview.footer_generic')
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: body
+            });
+
+  # Job 2-3: build & deploy (triggered from an issue comment)
+  build-preview-issue:
+    name: Preview build & deploy (Issue)
+    needs: [check-command, get-branch-from-issue]
+    if: |
+      needs.check-command.outputs.is_valid == 'true' &&
+      needs.check-command.outputs.command == 'build' &&
+      needs.check-command.outputs.is_pr == 'false' &&
+      needs.check-command.outputs.is_custom_branch != 'true' &&
+      needs.get-branch-from-issue.outputs.found == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Messages come from the same revision as this workflow (the PR merge commit on pull_request, otherwise the
+      # default branch) so they exist even before the default branch has them, and before the PR branch is checked out
+      - name: Checkout messages
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+          # Separate path: a sparse checkout at the workspace root would leave the later full checkout sparse too
+          path: .paw-msg
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        id: load_messages
+        run: |
+          # Keep a copy outside the workspace and drop the sparse clone so the later checkout sees a clean tree
+          mkdir -p "$RUNNER_TEMP/paw"
+          [ -f .paw-msg/.github/scripts/messages.py ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          cp .paw-msg/.github/scripts/messages.py "$RUNNER_TEMP/paw/messages.py"
+          LANG_CODE=$(cd .paw-msg && python3 "$RUNNER_TEMP/paw/messages.py" lang)
+          rm -rf .paw-msg
+          # The workspace root has no version.yml; pass the language resolved above to every later messages.py call
+          export PROJECT_AUTO_WIZARD_LANG="$LANG_CODE"
+          python3 "$RUNNER_TEMP/paw/messages.py" dump wf_preview. > "$RUNNER_TEMP/paw-msg.json"
+          echo "PROJECT_AUTO_WIZARD_LANG=$LANG_CODE" >> "$GITHUB_ENV"
+          # The deploy script runs on the remote server, where messages.py does not exist:
+          # ship the messages it needs as a small shell function (m KEY name=value ...)
+          python3 - >> "$GITHUB_ENV" <<'PY'
+          import json, os, shlex, subprocess
+          script = os.path.join(os.environ["RUNNER_TEMP"], "paw", "messages.py")
+          msgs = json.loads(subprocess.check_output(["python3", script, "dump", "wf_preview.r_"], text=True))
+          head = ["m() {", '  case "$1" in']
+          for key, text in msgs.items():
+              head.append("    %s) _t=%s ;;" % (key, shlex.quote(text)))
+          tail = r'''    *) _t="$1" ;;
+            esac
+            shift
+            while [ "$#" -gt 0 ]; do
+              _v=$(printf '%s' "${1#*=}" | sed 's/[\\&|]/\\&/g')
+              _t=$(printf '%s' "$_t" | sed "s|{${1%%=*}}|$_v|g")
+              shift
+            done
+            printf '%s\n' "$_t"
+          }'''
+          print("PAW_REMOTE<<PAW_EOF")
+          print("\n".join(head) + "\n" + tail)
+          print("PAW_EOF")
+          PY
+
+      - name: Check branch exists
+        id: check_branch
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_BRANCH_NAME: ${{ needs.get-branch-from-issue.outputs.branch_name }}
+          PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_ISSUE_NUMBER: ${{ needs.get-branch-from-issue.outputs.issue_number }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const branchName = process.env.PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_BRANCH_NAME;
+            const issueNumber = parseInt(process.env.PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_ISSUE_NUMBER, 10) || 0;
+
+            console.log(m('wf_preview.log_check_exists', {branchName}));
+
+            try {
+              await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: branchName
+              });
+              core.setOutput('exists', 'true');
+              console.log(m('wf_preview.log_branch_exists', {branchName}));
+            } catch (error) {
+              if (error.status === 404) {
+                core.setOutput('exists', 'false');
+                console.log(m('wf_preview.log_branch_missing', {branchName}));
+
+                // Comment for a missing branch
+                const body = [
+                  m('wf_preview.title_branch_missing'),
+                  '',
+                  m('wf_preview.tbl_items'),
+                  '|------|-----|',
+                  `| **Issue** | #${issueNumber} |`,
+                  m('wf_preview.env_branch', {branchName}),
+                  '',
+                  m('wf_preview.sec_check'),
+                  m('wf_preview.chk_pushed_1'),
+                  m('wf_preview.chk_name_2'),
+                  m('wf_preview.chk_deleted_3'),
+                  '',
+                  '---',
+                  m('wf_preview.footer_generic')
+                ].join('\n');
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  body: body
+                });
+              } else {
+                throw error;
+              }
+            }
+
+      - name: Skip when branch is missing
+        if: steps.check_branch.outputs.exists == 'false'
+        run: |
+          m() { python3 "$RUNNER_TEMP/paw/messages.py" get "$@"; }
+
+          m wf_preview.skip_no_branch
+          exit 0
+
+      - name: Set issue info
+        if: steps.check_branch.outputs.exists == 'true'
+        id: issue
+        env:
+          PAW_BRANCH_NAME: ${{ needs.get-branch-from-issue.outputs.branch_name }}
+        run: |
+          echo "ref=$PAW_BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "issue_number=${{ needs.get-branch-from-issue.outputs.issue_number }}" >> $GITHUB_OUTPUT
+          # Get the latest commit SHA of the branch
+          echo "sha=$(git ls-remote https://github.com/${{ github.repository }}.git "refs/heads/$PAW_BRANCH_NAME" | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      # Progress comment system
+      - name: Create progress comment
+        if: steps.check_branch.outputs.exists == 'true'
+        id: progress
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_BRANCH_NAME: ${{ needs.get-branch-from-issue.outputs.branch_name }}
+          PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_ISSUE_NUMBER: ${{ needs.get-branch-from-issue.outputs.issue_number }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const issueNumber = parseInt(process.env.PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_ISSUE_NUMBER, 10) || 0;
+            const branchName = process.env.PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_BRANCH_NAME;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const startTime = Date.now();
+
+            const body = [
+              m('wf_preview.title_issue_building'),
+              '',
+              m('wf_preview.line_branch', {branchName}),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_progress'),
+              m('wf_preview.row_deploy_wait'),
+              '',
+              m('wf_preview.link_logs', {runUrl}),
+              '',
+              '---',
+              m('wf_preview.footer_progress')
+            ].join('\n');
+
+            const { data: comment } = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: body
+            });
+
+            core.setOutput('comment_id', comment.id);
+            core.setOutput('start_time', startTime);
+            core.setOutput('docker_start', startTime);
+
+      - name: Checkout code
+        if: steps.check_branch.outputs.exists == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.get-branch-from-issue.outputs.branch_name }}
+
+      # If a required secret or the Dockerfile is missing, report the missing items and stop instead of surfacing a third-party error such as a docker login failure
+      - name: Deploy pre-check (Secrets and Dockerfile)
+        id: precheck
+        if: steps.check_branch.outputs.exists == 'true'
+        working-directory: ${{ env.PROJECT_PATH }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          DOCKERFILE: ${{ env.DOCKERFILE_PATH }}
+        run: |
+          m() { python3 "$RUNNER_TEMP/paw/messages.py" get "$@"; }
+
+          MISSING=""
+          for NAME in DOCKERHUB_USERNAME DOCKERHUB_TOKEN SERVER_HOST SERVER_USER; do
+            [ -n "${!NAME}" ] || MISSING="$MISSING $NAME"
+          done
+          # SSH_KEY is required when SSH_AUTH_METHOD=key, otherwise SERVER_PASSWORD
+          if [ "${SSH_AUTH_METHOD:-password}" = "key" ]; then
+            [ -n "$SSH_KEY" ] || MISSING="$MISSING SSH_KEY"
+          else
+            [ -n "$SERVER_PASSWORD" ] || MISSING="$MISSING SERVER_PASSWORD"
+          fi
+          FAILED=false
+          ITEMS=""
+          if [ -n "$MISSING" ]; then
+            echo "::error title=$(m wf_preview.precheck_secret_title)::$(m wf_preview.precheck_secret_body missing="$MISSING")"
+            ITEMS="${MISSING# }"
+            ITEMS="${ITEMS// /, }"
+            FAILED=true
+          fi
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "::error title=$(m wf_preview.precheck_dockerfile_title)::$(m wf_preview.precheck_dockerfile_body path="${PROJECT_PATH}/${DOCKERFILE#./}")"
+            ITEMS="${ITEMS:+$ITEMS, }Dockerfile"
+            FAILED=true
+          fi
+          if [ "$FAILED" = "true" ]; then
+            # The failure comment names what blocked the later steps instead of showing them as waiting
+            echo "missing=$ITEMS" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          m wf_preview.precheck_ok
+
+      # [Section 2] Create the environment file
+      - name: "[Required] Create .env file"
+        working-directory: ${{ env.PROJECT_PATH }}
+        if: steps.check_branch.outputs.exists == 'true'
+        run: |
+          cat << 'EOF' > .env
+          ${{ secrets.ENV_FILE }}
+          EOF
+      # [End of section 2] Create the environment file
+
+      - name: Log in to Docker Hub
+        if: steps.check_branch.outputs.exists == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: steps.check_branch.outputs.exists == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build & push Docker image
+        if: steps.check_branch.outputs.exists == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.PROJECT_PATH }}
+          file: ${{ env.PROJECT_PATH }}/${{ env.DOCKERFILE_PATH }}
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}:pr-${{ needs.get-branch-from-issue.outputs.issue_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Progress - Docker done
+        if: steps.check_branch.outputs.exists == 'true'
+        id: docker_progress
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_BRANCH_NAME: ${{ needs.get-branch-from-issue.outputs.branch_name }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID: ${{ steps.progress.outputs.comment_id }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_DOCKER_START: ${{ steps.progress.outputs.docker_start }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const commentId = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID, 10) || 0;
+            const branchName = process.env.PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_BRANCH_NAME;
+            const dockerStart = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_DOCKER_START, 10) || Date.now();
+            const now = Date.now();
+            const dockerElapsed = now - dockerStart;
+            const minutes = Math.floor(dockerElapsed / 60000);
+            const seconds = Math.floor((dockerElapsed % 60000) / 1000);
+            const dockerDuration = minutes > 0 ? m('wf_preview.dur_min_sec', {minutes, seconds}) : m('wf_preview.dur_sec', {seconds});
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const body = [
+              m('wf_preview.title_issue_building'),
+              '',
+              m('wf_preview.line_branch', {branchName}),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_done', {dockerDuration}),
+              m('wf_preview.row_deploy_progress'),
+              '',
+              m('wf_preview.link_logs', {runUrl}),
+              '',
+              '---',
+              m('wf_preview.footer_progress')
+            ].join('\n');
+
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: commentId,
+              body: body
+            });
+
+            core.setOutput('docker_duration', dockerDuration);
+            core.setOutput('deploy_start', now);
+
+      - name: Deploy to server
+        if: steps.check_branch.outputs.exists == 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SSH_AUTH_METHOD: ${{ env.SSH_AUTH_METHOD }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          envs: SSH_AUTH_METHOD
+          script: |
+            ${{ env.PAW_REMOTE }}
+
+            set -e
+
+            export PATH=$PATH:/usr/local/bin
+            export PW="${{ secrets.SERVER_PASSWORD }}"
+
+            # sudo wrapper that depends on the SSH auth method
+            SSH_AUTH_METHOD="${SSH_AUTH_METHOD:-password}"
+            if [ "${SSH_AUTH_METHOD}" = "key" ]; then
+              SUDO() { sudo "$@"; }
+            else
+              SUDO() { echo "$PW" | sudo -S "$@"; }
+            fi
+            m wf_preview.r_ssh_auth ssh_auth_method="${SSH_AUTH_METHOD}"
+
+            ISSUE_NUMBER=${{ needs.get-branch-from-issue.outputs.issue_number }}
+            PROJECT_NAME="${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}"
+            CONTAINER_NAME="${PROJECT_NAME}-pr-${ISSUE_NUMBER}"
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${PROJECT_NAME}:pr-${ISSUE_NUMBER}"
+            DOMAIN="${PROJECT_NAME}-pr-${ISSUE_NUMBER}.${{ env.PREVIEW_DOMAIN_SUFFIX }}"
+            INTERNAL_PORT="${{ env.INTERNAL_PORT }}"
+            TRAEFIK_NETWORK="${{ env.TRAEFIK_NETWORK }}"
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_deploy_head_issue
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_project_name project_name="${PROJECT_NAME}"
+            m wf_preview.r_num_issue issue_number="${ISSUE_NUMBER}"
+            m wf_preview.r_container_name container_name="${CONTAINER_NAME}"
+            m wf_preview.r_domain domain="${DOMAIN}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            m wf_preview.r_image_pulling
+            SUDO docker pull "${IMAGE}"
+
+            m wf_preview.r_existing_cleanup
+            SUDO docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+
+            VOLUME_OPTS="-v /etc/localtime:/etc/localtime:ro"
+            if [ -n "${{ env.PROJECT_TARGET_DIR }}" ] && [ -n "${{ env.PROJECT_MNT_DIR }}" ]; then
+              VOLUME_OPTS="$VOLUME_OPTS -v ${{ env.PROJECT_TARGET_DIR }}:${{ env.PROJECT_MNT_DIR }}"
+            fi
+
+            m wf_preview.r_container_starting
+            SUDO docker run -d \
+              --name "${CONTAINER_NAME}" \
+              --network "${TRAEFIK_NETWORK}" \
+              --label "traefik.enable=true" \
+              --label "traefik.http.routers.${CONTAINER_NAME}.rule=Host(\`${DOMAIN}\`)" \
+              --label "traefik.http.routers.${CONTAINER_NAME}.entrypoints=web" \
+              --label "traefik.http.services.${CONTAINER_NAME}.loadbalancer.server.port=${INTERNAL_PORT}" \
+              -e TZ=Asia/Seoul \
+              -e ENVIRONMENT=prod \
+              $VOLUME_OPTS \
+              "${IMAGE}"
+
+            # Health check (waits up to 120s) - hybrid approach
+            # 1. Try the HTTP check when HEALTH_CHECK_PATH is set
+            # 2. Fallback: log pattern match (HEALTH_CHECK_LOG_PATTERN)
+            echo ""
+            m wf_preview.r_hc_start
+            HEALTH_PATH="${{ env.HEALTH_CHECK_PATH }}"
+            LOG_PATTERN="${{ env.HEALTH_CHECK_LOG_PATTERN }}"
+            MAX_RETRIES=24
+            RETRY_COUNT=0
+            HEALTH_CHECK_PASSED=false
+            HEALTH_CHECK_METHOD=""
+
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              sleep 5
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+
+              # 1. Check the container state
+              STATUS=$(SUDO docker inspect --format='{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || echo "not_found")
+
+              if [ "$STATUS" = "exited" ]; then
+                m wf_preview.r_container_exited
+                echo ""
+                m wf_preview.r_container_logs
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                SUDO docker logs --tail 100 "${CONTAINER_NAME}"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                exit 1
+              fi
+
+              if [ "$STATUS" = "running" ]; then
+                # 2. Try the HTTP health check (only when HEALTH_CHECK_PATH is set)
+                if [ -n "$HEALTH_PATH" ]; then
+                  HEALTH=$(SUDO docker exec "${CONTAINER_NAME}" curl -sf "http://localhost:${INTERNAL_PORT}${HEALTH_PATH}" 2>/dev/null || echo "")
+
+                  if [ -n "$HEALTH" ]; then
+                    m wf_preview.r_hc_ok_http health_path="${HEALTH_PATH}"
+                    HEALTH_CHECK_PASSED=true
+                    HEALTH_CHECK_METHOD="HTTP"
+                    break
+                  fi
+                fi
+
+                # 3. Without an HTTP response, fall back to log pattern matching
+                if [ -n "$LOG_PATTERN" ]; then
+                  STARTED=$(SUDO docker logs --tail 50 "${CONTAINER_NAME}" 2>&1 | grep -E "$LOG_PATTERN" || echo "")
+
+                  if [ -n "$STARTED" ]; then
+                    m wf_preview.r_hc_ok_log
+                    echo "   $STARTED"
+                    HEALTH_CHECK_PASSED=true
+                    HEALTH_CHECK_METHOD="Log"
+                    break
+                  fi
+                fi
+              fi
+
+              m wf_preview.r_hc_waiting retry_count="$RETRY_COUNT" max_retries="$MAX_RETRIES" status="$STATUS"
+            done
+
+            if [ "$HEALTH_CHECK_PASSED" = "false" ]; then
+              echo ""
+              m wf_preview.r_hc_timeout
+              echo ""
+              m wf_preview.r_container_logs
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              SUDO docker logs --tail 100 "${CONTAINER_NAME}"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              exit 1
+            fi
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_hc_done health_check_method="${HEALTH_CHECK_METHOD}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: Deploy complete comment
+        if: steps.check_branch.outputs.exists == 'true'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_BRANCH_NAME: ${{ needs.get-branch-from-issue.outputs.branch_name }}
+          PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION: ${{ steps.docker_progress.outputs.docker_duration }}
+          PAW_IN_STEPS_ISSUE_OUTPUTS_SHA: ${{ steps.issue.outputs.sha }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID: ${{ steps.progress.outputs.comment_id }}
+          PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DEPLOY_START: ${{ steps.docker_progress.outputs.deploy_start }}
+          PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_ISSUE_NUMBER: ${{ needs.get-branch-from-issue.outputs.issue_number }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const commentId = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID, 10) || 0;
+            const branchName = process.env.PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_BRANCH_NAME;
+            const dockerDuration = process.env.PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION;
+            const deployStart = parseInt(process.env.PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DEPLOY_START, 10) || Date.now();
+            const now = Date.now();
+            const deployElapsed = now - deployStart;
+            const minutes = Math.floor(deployElapsed / 60000);
+            const seconds = Math.floor((deployElapsed % 60000) / 1000);
+            const deployDuration = minutes > 0 ? m('wf_preview.dur_min_sec', {minutes, seconds}) : m('wf_preview.dur_sec', {seconds});
+
+            const projectName = process.env.PROJECT_PATH !== '.' ? process.env.PROJECT_NAME + '-go' : process.env.PROJECT_NAME;
+            const domainSuffix = process.env.PREVIEW_DOMAIN_SUFFIX;
+            const previewPort = process.env.PREVIEW_PORT;
+            const apiDocsPath = process.env.API_DOCS_PATH;
+            const issueNumber = parseInt(process.env.PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_ISSUE_NUMBER, 10) || 0;
+            const domain = `${projectName}-pr-${issueNumber}.${domainSuffix}`;
+            const previewUrl = `http://${domain}:${previewPort}`;
+            const sha = process.env.PAW_IN_STEPS_ISSUE_OUTPUTS_SHA;
+
+            // Build the preview environment table (the API Docs row is added only when API_DOCS_PATH is set)
+            const envRows = [
+              `| **Preview URL** | ${previewUrl} |`,
+            ];
+            if (apiDocsPath) {
+              envRows.push(`| **API Docs** | ${previewUrl}${apiDocsPath} |`);
+            }
+            envRows.push(m('wf_preview.env_container_issue', {projectName, issueNumber}));
+            envRows.push(m('wf_preview.env_branch', {branchName}));
+            envRows.push(m('wf_preview.env_commit', {sha}));
+
+            const body = [
+              m('wf_preview.title_issue_deployed'),
+              '',
+              m('wf_preview.line_branch', {branchName}),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_done', {dockerDuration}),
+              m('wf_preview.row_deploy_done', {deployDuration}),
+              '',
+              m('wf_preview.sec_env'),
+              m('wf_preview.tbl_items'),
+              '|------|-----|',
+              ...envRows,
+              '',
+              m('wf_preview.sec_commands'),
+              m('wf_preview.tbl_commands'),
+              '|--------|------|',
+              m('wf_preview.cmd_build'),
+              m('wf_preview.cmd_destroy'),
+              m('wf_preview.cmd_status'),
+              '',
+              '<details>',
+              m('wf_preview.cmd_advanced'),
+              '',
+              '```',
+              `/wizard server build ${branchName}`,
+              `/wizard server destroy ${branchName}`,
+              `/wizard server status ${branchName}`,
+              '```',
+              '</details>',
+              '',
+              '---',
+              m('wf_preview.footer_issue')
+            ].join('\n');
+
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: commentId,
+              body: body
+            });
+
+      - name: Build/deploy failure comment
+        if: failure() && steps.load_messages.outcome == 'success' && steps.check_branch.outputs.exists == 'true'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_BRANCH_NAME: ${{ needs.get-branch-from-issue.outputs.branch_name }}
+          PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION: ${{ steps.docker_progress.outputs.docker_duration }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID: ${{ steps.progress.outputs.comment_id }}
+          PAW_IN_STEPS_PRECHECK_OUTCOME: ${{ steps.precheck.outcome }}
+          PAW_IN_STEPS_PRECHECK_OUTPUTS_MISSING: ${{ steps.precheck.outputs.missing }}
+          PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_ISSUE_NUMBER: ${{ needs.get-branch-from-issue.outputs.issue_number }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const commentId = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID, 10) || 0;
+            const projectName = process.env.PROJECT_PATH !== '.' ? process.env.PROJECT_NAME + '-go' : process.env.PROJECT_NAME;
+            const issueNumber = parseInt(process.env.PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_ISSUE_NUMBER, 10) || 0;
+            const branchName = process.env.PAW_IN_NEEDS_GET_BRANCH_FROM_ISSUE_OUTPUTS_BRANCH_NAME;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const dockerDuration = process.env.PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION;
+
+            let dockerStatus, deployStatus;
+            let dockerTime = '-';
+
+            if (!commentId) {
+              dockerStatus = m('wf_preview.status_init_failed');
+              deployStatus = '-';
+            } else if (process.env.PAW_IN_STEPS_PRECHECK_OUTCOME === 'failure') {
+              // The pre-check stopped the run before any build step: say why nothing ran
+              dockerStatus = deployStatus = m('wf_preview.status_precheck_blocked', { missing: process.env.PAW_IN_STEPS_PRECHECK_OUTPUTS_MISSING || '-' });
+            } else if (!dockerDuration || dockerDuration === '') {
+              // Failed at the Docker build stage; the deploy step never ran
+              dockerStatus = m('wf_preview.status_failed');
+              deployStatus = m('wf_preview.status_not_run');
+            } else {
+              dockerStatus = m('wf_preview.status_done');
+              deployStatus = m('wf_preview.status_failed');
+              dockerTime = dockerDuration;
+            }
+
+            const body = [
+              m('wf_preview.title_issue_failed'),
+              '',
+              m('wf_preview.line_branch', {branchName}),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_status', {dockerStatus, dockerTime}),
+              m('wf_preview.row_deploy_status', {deployStatus}),
+              '',
+              m('wf_preview.link_build_logs', {runUrl}),
+              '',
+              m('wf_preview.sec_causes'),
+              m('wf_preview.hint_secrets'),
+              m('wf_preview.hint_docker_go'),
+              m('wf_preview.hint_start_go'),
+              m('wf_preview.hint_health_timeout'),
+              m('wf_preview.hint_env_missing'),
+              '',
+              m('wf_preview.sec_next'),
+              m('wf_preview.next_logs'),
+              m('wf_preview.next_retry'),
+              '',
+              '---',
+              m('wf_preview.footer_issue')
+            ].join('\n');
+
+            if (commentId) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: commentId,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: body
+              });
+            }
+
+  # Job 3: destroy the preview (PR/issue closed or destroy command)
+  destroy-preview:
+    name: Destroy preview
+    # No needs dependency: lets this run on its own for PR/issue closed events
+    if: |
+      (github.event_name == 'pull_request' && github.event.action == 'closed') ||
+      (github.event_name == 'issues' && github.event.action == 'closed') ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/wizard') && contains(github.event.comment.body, 'server destroy'))
+    runs-on: ubuntu-latest
+    steps:
+      # Messages come from the same revision as this workflow (the PR merge commit on pull_request, otherwise the
+      # default branch) so they exist even before the default branch has them, and before the PR branch is checked out
+      - name: Checkout messages
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+          # Separate path: a sparse checkout at the workspace root would leave the later full checkout sparse too
+          path: .paw-msg
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        run: |
+          # Keep a copy outside the workspace and drop the sparse clone so the later checkout sees a clean tree
+          mkdir -p "$RUNNER_TEMP/paw"
+          [ -f .paw-msg/.github/scripts/messages.py ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          cp .paw-msg/.github/scripts/messages.py "$RUNNER_TEMP/paw/messages.py"
+          LANG_CODE=$(cd .paw-msg && python3 "$RUNNER_TEMP/paw/messages.py" lang)
+          rm -rf .paw-msg
+          # The workspace root has no version.yml; pass the language resolved above to every later messages.py call
+          export PROJECT_AUTO_WIZARD_LANG="$LANG_CODE"
+          python3 "$RUNNER_TEMP/paw/messages.py" dump wf_preview. > "$RUNNER_TEMP/paw-msg.json"
+          echo "PROJECT_AUTO_WIZARD_LANG=$LANG_CODE" >> "$GITHUB_ENV"
+          # The deploy script runs on the remote server, where messages.py does not exist:
+          # ship the messages it needs as a small shell function (m KEY name=value ...)
+          python3 - >> "$GITHUB_ENV" <<'PY'
+          import json, os, shlex, subprocess
+          script = os.path.join(os.environ["RUNNER_TEMP"], "paw", "messages.py")
+          msgs = json.loads(subprocess.check_output(["python3", script, "dump", "wf_preview.r_"], text=True))
+          head = ["m() {", '  case "$1" in']
+          for key, text in msgs.items():
+              head.append("    %s) _t=%s ;;" % (key, shlex.quote(text)))
+          tail = r'''    *) _t="$1" ;;
+            esac
+            shift
+            while [ "$#" -gt 0 ]; do
+              _v=$(printf '%s' "${1#*=}" | sed 's/[\\&|]/\\&/g')
+              _t=$(printf '%s' "$_t" | sed "s|{${1%%=*}}|$_v|g")
+              shift
+            done
+            printf '%s\n' "$_t"
+          }'''
+          print("PAW_REMOTE<<PAW_EOF")
+          print("\n".join(head) + "\n" + tail)
+          print("PAW_EOF")
+          PY
+
+      # Without the deploy secrets no preview could have been deployed: on close events skip the cleanup quietly,
+      # and on an explicit command report what is missing instead of surfacing a raw SSH action error
+      - name: Deploy pre-check (Secrets)
+        id: precheck
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          m() { python3 "$RUNNER_TEMP/paw/messages.py" get "$@"; }
+
+          MISSING=""
+          for NAME in DOCKERHUB_USERNAME SERVER_HOST SERVER_USER; do
+            [ -n "${!NAME}" ] || MISSING="$MISSING $NAME"
+          done
+          # SSH_KEY is required when SSH_AUTH_METHOD=key, otherwise SERVER_PASSWORD
+          if [ "${SSH_AUTH_METHOD:-password}" = "key" ]; then
+            [ -n "$SSH_KEY" ] || MISSING="$MISSING SSH_KEY"
+          else
+            [ -n "$SERVER_PASSWORD" ] || MISSING="$MISSING SERVER_PASSWORD"
+          fi
+          if [ -n "$MISSING" ]; then
+            if [ "$EVENT_NAME" = "issue_comment" ]; then
+              echo "::error title=$(m wf_preview.precheck_secret_title)::$(m wf_preview.precheck_secret_body missing="$MISSING")"
+              exit 1
+            fi
+            echo "::warning title=$(m wf_preview.precheck_skip_title)::$(m wf_preview.precheck_skip_body missing="$MISSING")"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Get PR/issue number
+        id: pr_number
+        run: |
+          if [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            echo "type=comment" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "number=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+            echo "type=pr_closed" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+            echo "type=issue_closed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Remove container & image
+        if: steps.precheck.outputs.ready == 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SSH_AUTH_METHOD: ${{ env.SSH_AUTH_METHOD }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          envs: SSH_AUTH_METHOD
+          script: |
+            ${{ env.PAW_REMOTE }}
+
+            export PATH=$PATH:/usr/local/bin
+            export PW="${{ secrets.SERVER_PASSWORD }}"
+
+            # sudo wrapper that depends on the SSH auth method
+            SSH_AUTH_METHOD="${SSH_AUTH_METHOD:-password}"
+            if [ "${SSH_AUTH_METHOD}" = "key" ]; then
+              SUDO() { sudo "$@"; }
+            else
+              SUDO() { echo "$PW" | sudo -S "$@"; }
+            fi
+            m wf_preview.r_ssh_auth ssh_auth_method="${SSH_AUTH_METHOD}"
+
+            PR_NUMBER=${{ steps.pr_number.outputs.number }}
+            PROJECT_NAME="${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}"
+            CONTAINER_NAME="${PROJECT_NAME}-pr-${PR_NUMBER}"
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${PROJECT_NAME}:pr-${PR_NUMBER}"
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_destroy_head_pr
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_project_name project_name="${PROJECT_NAME}"
+            m wf_preview.r_num_pr pr_number="${PR_NUMBER}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            m wf_preview.r_container_removing
+            SUDO docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+
+            m wf_preview.r_image_removing
+            SUDO docker rmi "${IMAGE}" 2>/dev/null || true
+
+            m wf_preview.r_removed
+
+      - name: Destroy complete comment
+        if: |
+          steps.precheck.outputs.ready == 'true' && (
+            github.event_name == 'issue_comment' ||
+            (github.event_name == 'pull_request' && github.event.action == 'closed') ||
+            (github.event_name == 'issues' && github.event.action == 'closed'))
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_STEPS_PR_NUMBER_OUTPUTS_NUMBER: ${{ steps.pr_number.outputs.number }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const number = parseInt(process.env.PAW_IN_STEPS_PR_NUMBER_OUTPUTS_NUMBER, 10) || 0;
+            const projectName = process.env.PROJECT_PATH !== '.' ? process.env.PROJECT_NAME + '-go' : process.env.PROJECT_NAME;
+
+            const body = [
+              m('wf_preview.title_destroyed'),
+              '',
+              m('wf_preview.tbl_items'),
+              '|------|-----|',
+              m('wf_preview.env_container_num', {projectName, number}),
+              m('wf_preview.env_status_deleted'),
+              '',
+              m('wf_preview.redeploy_hint'),
+              '',
+              '---',
+              m('wf_preview.footer_pr_issue')
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: number,
+              body: body
+            });
+
+  # Job 4: status check (PR and issue)
+  check-status:
+    name: Preview status
+    needs: check-command
+    if: needs.check-command.outputs.is_valid == 'true' && needs.check-command.outputs.command == 'status'
+    runs-on: ubuntu-latest
+    steps:
+      # Messages come from the same revision as this workflow (the PR merge commit on pull_request, otherwise the
+      # default branch) so they exist even before the default branch has them, and before the PR branch is checked out
+      - name: Checkout messages
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+          # Separate path: a sparse checkout at the workspace root would leave the later full checkout sparse too
+          path: .paw-msg
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        run: |
+          # Keep a copy outside the workspace and drop the sparse clone so the later checkout sees a clean tree
+          mkdir -p "$RUNNER_TEMP/paw"
+          [ -f .paw-msg/.github/scripts/messages.py ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          cp .paw-msg/.github/scripts/messages.py "$RUNNER_TEMP/paw/messages.py"
+          LANG_CODE=$(cd .paw-msg && python3 "$RUNNER_TEMP/paw/messages.py" lang)
+          rm -rf .paw-msg
+          # The workspace root has no version.yml; pass the language resolved above to every later messages.py call
+          export PROJECT_AUTO_WIZARD_LANG="$LANG_CODE"
+          python3 "$RUNNER_TEMP/paw/messages.py" dump wf_preview. > "$RUNNER_TEMP/paw-msg.json"
+          echo "PROJECT_AUTO_WIZARD_LANG=$LANG_CODE" >> "$GITHUB_ENV"
+          # The deploy script runs on the remote server, where messages.py does not exist:
+          # ship the messages it needs as a small shell function (m KEY name=value ...)
+          python3 - >> "$GITHUB_ENV" <<'PY'
+          import json, os, shlex, subprocess
+          script = os.path.join(os.environ["RUNNER_TEMP"], "paw", "messages.py")
+          msgs = json.loads(subprocess.check_output(["python3", script, "dump", "wf_preview.r_"], text=True))
+          head = ["m() {", '  case "$1" in']
+          for key, text in msgs.items():
+              head.append("    %s) _t=%s ;;" % (key, shlex.quote(text)))
+          tail = r'''    *) _t="$1" ;;
+            esac
+            shift
+            while [ "$#" -gt 0 ]; do
+              _v=$(printf '%s' "${1#*=}" | sed 's/[\\&|]/\\&/g')
+              _t=$(printf '%s' "$_t" | sed "s|{${1%%=*}}|$_v|g")
+              shift
+            done
+            printf '%s\n' "$_t"
+          }'''
+          print("PAW_REMOTE<<PAW_EOF")
+          print("\n".join(head) + "\n" + tail)
+          print("PAW_EOF")
+          PY
+
+      # Report the missing secrets by name instead of surfacing a raw SSH action error
+      - name: Deploy pre-check (Secrets)
+        id: precheck
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          m() { python3 "$RUNNER_TEMP/paw/messages.py" get "$@"; }
+
+          MISSING=""
+          for NAME in SERVER_HOST SERVER_USER; do
+            [ -n "${!NAME}" ] || MISSING="$MISSING $NAME"
+          done
+          # SSH_KEY is required when SSH_AUTH_METHOD=key, otherwise SERVER_PASSWORD
+          if [ "${SSH_AUTH_METHOD:-password}" = "key" ]; then
+            [ -n "$SSH_KEY" ] || MISSING="$MISSING SSH_KEY"
+          else
+            [ -n "$SERVER_PASSWORD" ] || MISSING="$MISSING SERVER_PASSWORD"
+          fi
+          if [ -n "$MISSING" ]; then
+            echo "::error title=$(m wf_preview.precheck_secret_title)::$(m wf_preview.precheck_secret_body missing="$MISSING")"
+            exit 1
+          fi
+
+      - name: Check container status
+        id: status
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          script: |
+            ${{ env.PAW_REMOTE }}
+
+            export PATH=$PATH:/usr/local/bin
+
+            NUMBER=${{ github.event.issue.number }}
+            PROJECT_NAME="${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}"
+            CONTAINER_NAME="${PROJECT_NAME}-pr-${NUMBER}"
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_status_head
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            if docker ps --filter "name=${CONTAINER_NAME}" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then
+              echo "STATUS=running"
+              m wf_preview.r_container_running
+              docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
+            else
+              echo "STATUS=not_found"
+              m wf_preview.r_container_absent
+            fi
+
+      - name: Status check (running)
+        uses: appleboy/ssh-action@v1.0.3
+        id: check_running
+        continue-on-error: true
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          script: |
+            export PATH=$PATH:/usr/local/bin
+
+            NUMBER=${{ github.event.issue.number }}
+            PROJECT_NAME="${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}"
+            CONTAINER_NAME="${PROJECT_NAME}-pr-${NUMBER}"
+            docker ps --filter "name=${CONTAINER_NAME}" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"
+
+      - name: Post status comment
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_IS_PR: ${{ needs.check-command.outputs.is_pr }}
+          PAW_IN_STEPS_CHECK_RUNNING_OUTCOME: ${{ steps.check_running.outcome }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const number = context.issue.number;
+            const projectName = process.env.PROJECT_PATH !== '.' ? process.env.PROJECT_NAME + '-go' : process.env.PROJECT_NAME;
+            const domainSuffix = process.env.PREVIEW_DOMAIN_SUFFIX;
+            const previewPort = process.env.PREVIEW_PORT;
+            const domain = `${projectName}-pr-${number}.${domainSuffix}`;
+            const previewUrl = `http://${domain}:${previewPort}`;
+            const isRunning = process.env.PAW_IN_STEPS_CHECK_RUNNING_OUTCOME === 'success';
+            const isPr = process.env.PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_IS_PR === 'true';
+            const contextType = isPr ? 'PR' : 'Issue';
+
+            let body;
+            if (isRunning) {
+              body = [
+                m('wf_preview.title_running'),
+                '',
+                m('wf_preview.tbl_items'),
+                '|------|-----|',
+                `| **Preview URL** | ${previewUrl} |`,
+                m('wf_preview.env_container_num', {projectName, number}),
+                m('wf_preview.env_status_running'),
+                '',
+                m('wf_preview.sec_commands'),
+                m('wf_preview.tbl_commands'),
+                '|--------|------|',
+                m('wf_preview.cmd_build'),
+                m('wf_preview.cmd_destroy'),
+                '',
+                '---',
+                m('wf_preview.footer_context', {contextType})
+              ].join('\n');
+            } else {
+              body = [
+                m('wf_preview.title_absent'),
+                '',
+                m('wf_preview.tbl_items'),
+                '|------|-----|',
+                m('wf_preview.env_container_num', {projectName, number}),
+                m('wf_preview.env_status_absent'),
+                '',
+                m('wf_preview.deploy_hint'),
+                '',
+                '---',
+                m('wf_preview.footer_context', {contextType})
+              ].join('\n');
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: number,
+              body: body
+            });
+
+  # Job 5: custom branch build & deploy
+  build-preview-custom-branch:
+    name: Preview build & deploy (Custom Branch)
+    needs: check-command
+    if: |
+      needs.check-command.outputs.is_valid == 'true' &&
+      needs.check-command.outputs.command == 'build' &&
+      needs.check-command.outputs.is_custom_branch == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Messages come from the same revision as this workflow (the PR merge commit on pull_request, otherwise the
+      # default branch) so they exist even before the default branch has them, and before the PR branch is checked out
+      - name: Checkout messages
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+          # Separate path: a sparse checkout at the workspace root would leave the later full checkout sparse too
+          path: .paw-msg
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        id: load_messages
+        run: |
+          # Keep a copy outside the workspace and drop the sparse clone so the later checkout sees a clean tree
+          mkdir -p "$RUNNER_TEMP/paw"
+          [ -f .paw-msg/.github/scripts/messages.py ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          cp .paw-msg/.github/scripts/messages.py "$RUNNER_TEMP/paw/messages.py"
+          LANG_CODE=$(cd .paw-msg && python3 "$RUNNER_TEMP/paw/messages.py" lang)
+          rm -rf .paw-msg
+          # The workspace root has no version.yml; pass the language resolved above to every later messages.py call
+          export PROJECT_AUTO_WIZARD_LANG="$LANG_CODE"
+          python3 "$RUNNER_TEMP/paw/messages.py" dump wf_preview. > "$RUNNER_TEMP/paw-msg.json"
+          echo "PROJECT_AUTO_WIZARD_LANG=$LANG_CODE" >> "$GITHUB_ENV"
+          # The deploy script runs on the remote server, where messages.py does not exist:
+          # ship the messages it needs as a small shell function (m KEY name=value ...)
+          python3 - >> "$GITHUB_ENV" <<'PY'
+          import json, os, shlex, subprocess
+          script = os.path.join(os.environ["RUNNER_TEMP"], "paw", "messages.py")
+          msgs = json.loads(subprocess.check_output(["python3", script, "dump", "wf_preview.r_"], text=True))
+          head = ["m() {", '  case "$1" in']
+          for key, text in msgs.items():
+              head.append("    %s) _t=%s ;;" % (key, shlex.quote(text)))
+          tail = r'''    *) _t="$1" ;;
+            esac
+            shift
+            while [ "$#" -gt 0 ]; do
+              _v=$(printf '%s' "${1#*=}" | sed 's/[\\&|]/\\&/g')
+              _t=$(printf '%s' "$_t" | sed "s|{${1%%=*}}|$_v|g")
+              shift
+            done
+            printf '%s\n' "$_t"
+          }'''
+          print("PAW_REMOTE<<PAW_EOF")
+          print("\n".join(head) + "\n" + tail)
+          print("PAW_EOF")
+          PY
+
+      - name: Check branch exists and extract info
+        id: branch_info
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH: ${{ needs.check-command.outputs.custom_branch }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const branchName = process.env.PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH;
+            const issueNumber = context.issue.number;
+
+            console.log(m('wf_preview.log_check_branch', {branchName}));
+
+            // Check whether the branch exists
+            try {
+              await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: branchName
+              });
+              console.log(m('wf_preview.log_branch_exists', {branchName}));
+            } catch (error) {
+              if (error.status === 404) {
+                console.log(m('wf_preview.log_branch_missing', {branchName}));
+
+                // Post the error comment
+                const body = [
+                  m('wf_preview.title_branch_missing'),
+                  '',
+                  m('wf_preview.tbl_items'),
+                  '|------|-----|',
+                  m('wf_preview.env_branch', {branchName}),
+                  '',
+                  m('wf_preview.sec_check'),
+                  m('wf_preview.chk_name_1'),
+                  m('wf_preview.chk_pushed_2'),
+                  m('wf_preview.chk_deleted_3'),
+                  '',
+                  '---',
+                  m('wf_preview.footer_generic')
+                ].join('\n');
+
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  body: body
+                });
+
+                core.setFailed(m('wf_preview.fail_branch_missing'));
+                return;
+              }
+              throw error;
+            }
+
+            // Extract the issue number from the branch name (#number pattern)
+            const issueMatch = branchName.match(/#(\d+)/);
+
+            if (issueMatch) {
+              // Number extracted
+              core.setOutput('container_number', issueMatch[1]);
+              core.setOutput('use_hash', 'false');
+              console.log(m('wf_preview.log_issue_number', {n: issueMatch[1]}));
+            } else {
+              // Generate a hash
+              let hash = 0;
+              for (let i = 0; i < branchName.length; i++) {
+                const char = branchName.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash;
+              }
+              const hashStr = Math.abs(hash).toString(16).slice(-6).padStart(6, '0');
+              core.setOutput('container_suffix', `custom-${hashStr}`);
+              core.setOutput('use_hash', 'true');
+              console.log(m('wf_preview.log_hash', {hashStr}));
+            }
+
+            core.setOutput('branch_name', branchName);
+            core.setOutput('branch_exists', 'true');
+
+      - name: Get latest commit SHA of the branch
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        id: get_sha
+        env:
+          PAW_BRANCH_NAME: ${{ needs.check-command.outputs.custom_branch }}
+        run: |
+          SHA=$(git ls-remote https://github.com/${{ github.repository }}.git "refs/heads/$PAW_BRANCH_NAME" | cut -c1-7)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Create progress comment
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        id: progress
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH: ${{ needs.check-command.outputs.custom_branch }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const issueNumber = context.issue.number;
+            const branchName = process.env.PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const startTime = Date.now();
+
+            const body = [
+              m('wf_preview.title_custom_building'),
+              '',
+              m('wf_preview.line_branch', {branchName}),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_progress'),
+              m('wf_preview.row_deploy_wait'),
+              '',
+              m('wf_preview.link_logs', {runUrl}),
+              '',
+              '---',
+              m('wf_preview.footer_progress')
+            ].join('\n');
+
+            const { data: comment } = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: body
+            });
+
+            core.setOutput('comment_id', comment.id);
+            core.setOutput('start_time', startTime);
+            core.setOutput('docker_start', startTime);
+
+      - name: Checkout code
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check-command.outputs.custom_branch }}
+
+      # If a required secret or the Dockerfile is missing, report the missing items and stop instead of surfacing a third-party error such as a docker login failure
+      - name: Deploy pre-check (Secrets and Dockerfile)
+        id: precheck
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        working-directory: ${{ env.PROJECT_PATH }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          DOCKERFILE: ${{ env.DOCKERFILE_PATH }}
+        run: |
+          m() { python3 "$RUNNER_TEMP/paw/messages.py" get "$@"; }
+
+          MISSING=""
+          for NAME in DOCKERHUB_USERNAME DOCKERHUB_TOKEN SERVER_HOST SERVER_USER; do
+            [ -n "${!NAME}" ] || MISSING="$MISSING $NAME"
+          done
+          # SSH_KEY is required when SSH_AUTH_METHOD=key, otherwise SERVER_PASSWORD
+          if [ "${SSH_AUTH_METHOD:-password}" = "key" ]; then
+            [ -n "$SSH_KEY" ] || MISSING="$MISSING SSH_KEY"
+          else
+            [ -n "$SERVER_PASSWORD" ] || MISSING="$MISSING SERVER_PASSWORD"
+          fi
+          FAILED=false
+          ITEMS=""
+          if [ -n "$MISSING" ]; then
+            echo "::error title=$(m wf_preview.precheck_secret_title)::$(m wf_preview.precheck_secret_body missing="$MISSING")"
+            ITEMS="${MISSING# }"
+            ITEMS="${ITEMS// /, }"
+            FAILED=true
+          fi
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "::error title=$(m wf_preview.precheck_dockerfile_title)::$(m wf_preview.precheck_dockerfile_body path="${PROJECT_PATH}/${DOCKERFILE#./}")"
+            ITEMS="${ITEMS:+$ITEMS, }Dockerfile"
+            FAILED=true
+          fi
+          if [ "$FAILED" = "true" ]; then
+            # The failure comment names what blocked the later steps instead of showing them as waiting
+            echo "missing=$ITEMS" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          m wf_preview.precheck_ok
+
+      - name: "[Required] Create .env file"
+        working-directory: ${{ env.PROJECT_PATH }}
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        run: |
+          cat << 'EOF' > .env
+          ${{ secrets.ENV_FILE }}
+          EOF
+
+      - name: Log in to Docker Hub
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Resolve container name
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        id: container
+        run: |
+          if [[ "${{ steps.branch_info.outputs.use_hash }}" == "true" ]]; then
+            SUFFIX="${{ steps.branch_info.outputs.container_suffix }}"
+          else
+            SUFFIX="pr-${{ steps.branch_info.outputs.container_number }}"
+          fi
+          echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
+          echo "name=${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}-${SUFFIX}" >> $GITHUB_OUTPUT
+
+      - name: Build & push Docker image
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.PROJECT_PATH }}
+          file: ${{ env.PROJECT_PATH }}/${{ env.DOCKERFILE_PATH }}
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}:${{ steps.container.outputs.suffix }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Progress - Docker done
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        id: docker_progress
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH: ${{ needs.check-command.outputs.custom_branch }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID: ${{ steps.progress.outputs.comment_id }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_DOCKER_START: ${{ steps.progress.outputs.docker_start }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const commentId = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID, 10) || 0;
+            const branchName = process.env.PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH;
+            const dockerStart = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_DOCKER_START, 10) || Date.now();
+            const now = Date.now();
+            const dockerElapsed = now - dockerStart;
+            const minutes = Math.floor(dockerElapsed / 60000);
+            const seconds = Math.floor((dockerElapsed % 60000) / 1000);
+            const dockerDuration = minutes > 0 ? m('wf_preview.dur_min_sec', {minutes, seconds}) : m('wf_preview.dur_sec', {seconds});
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const body = [
+              m('wf_preview.title_custom_building'),
+              '',
+              m('wf_preview.line_branch', {branchName}),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_done', {dockerDuration}),
+              m('wf_preview.row_deploy_progress'),
+              '',
+              m('wf_preview.link_logs', {runUrl}),
+              '',
+              '---',
+              m('wf_preview.footer_progress')
+            ].join('\n');
+
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: commentId,
+              body: body
+            });
+
+            core.setOutput('docker_duration', dockerDuration);
+            core.setOutput('deploy_start', now);
+
+      - name: Deploy to server
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SSH_AUTH_METHOD: ${{ env.SSH_AUTH_METHOD }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          envs: SSH_AUTH_METHOD
+          script: |
+            ${{ env.PAW_REMOTE }}
+
+            set -e
+
+            export PATH=$PATH:/usr/local/bin
+            export PW="${{ secrets.SERVER_PASSWORD }}"
+
+            # sudo wrapper that depends on the SSH auth method
+            SSH_AUTH_METHOD="${SSH_AUTH_METHOD:-password}"
+            if [ "${SSH_AUTH_METHOD}" = "key" ]; then
+              SUDO() { sudo "$@"; }
+            else
+              SUDO() { echo "$PW" | sudo -S "$@"; }
+            fi
+            m wf_preview.r_ssh_auth ssh_auth_method="${SSH_AUTH_METHOD}"
+
+            PROJECT_NAME="${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}"
+            CONTAINER_NAME="${{ steps.container.outputs.name }}"
+            CONTAINER_SUFFIX="${{ steps.container.outputs.suffix }}"
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${PROJECT_NAME}:${CONTAINER_SUFFIX}"
+            DOMAIN="${CONTAINER_NAME}.${{ env.PREVIEW_DOMAIN_SUFFIX }}"
+            INTERNAL_PORT="${{ env.INTERNAL_PORT }}"
+            TRAEFIK_NETWORK="${{ env.TRAEFIK_NETWORK }}"
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_deploy_head_custom
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_project_name project_name="${PROJECT_NAME}"
+            m wf_preview.r_container_name container_name="${CONTAINER_NAME}"
+            m wf_preview.r_domain domain="${DOMAIN}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            m wf_preview.r_image_pulling
+            SUDO docker pull "${IMAGE}"
+
+            m wf_preview.r_existing_cleanup
+            SUDO docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+
+            VOLUME_OPTS="-v /etc/localtime:/etc/localtime:ro"
+            if [ -n "${{ env.PROJECT_TARGET_DIR }}" ] && [ -n "${{ env.PROJECT_MNT_DIR }}" ]; then
+              VOLUME_OPTS="$VOLUME_OPTS -v ${{ env.PROJECT_TARGET_DIR }}:${{ env.PROJECT_MNT_DIR }}"
+            fi
+
+            m wf_preview.r_container_starting
+            SUDO docker run -d \
+              --name "${CONTAINER_NAME}" \
+              --network "${TRAEFIK_NETWORK}" \
+              --label "traefik.enable=true" \
+              --label "traefik.http.routers.${CONTAINER_NAME}.rule=Host(\`${DOMAIN}\`)" \
+              --label "traefik.http.routers.${CONTAINER_NAME}.entrypoints=web" \
+              --label "traefik.http.services.${CONTAINER_NAME}.loadbalancer.server.port=${INTERNAL_PORT}" \
+              -e TZ=Asia/Seoul \
+              -e ENVIRONMENT=prod \
+              $VOLUME_OPTS \
+              "${IMAGE}"
+
+            # Health Check
+            echo ""
+            m wf_preview.r_hc_start
+            HEALTH_PATH="${{ env.HEALTH_CHECK_PATH }}"
+            LOG_PATTERN="${{ env.HEALTH_CHECK_LOG_PATTERN }}"
+            MAX_RETRIES=24
+            RETRY_COUNT=0
+            HEALTH_CHECK_PASSED=false
+            HEALTH_CHECK_METHOD=""
+
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              sleep 5
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+
+              STATUS=$(SUDO docker inspect --format='{{.State.Status}}' "${CONTAINER_NAME}" 2>/dev/null || echo "not_found")
+
+              if [ "$STATUS" = "exited" ]; then
+                m wf_preview.r_container_exited
+                echo ""
+                m wf_preview.r_container_logs
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                SUDO docker logs --tail 100 "${CONTAINER_NAME}"
+                echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                exit 1
+              fi
+
+              if [ "$STATUS" = "running" ]; then
+                if [ -n "$HEALTH_PATH" ]; then
+                  HEALTH=$(SUDO docker exec "${CONTAINER_NAME}" curl -sf "http://localhost:${INTERNAL_PORT}${HEALTH_PATH}" 2>/dev/null || echo "")
+
+                  if [ -n "$HEALTH" ]; then
+                    m wf_preview.r_hc_ok_http health_path="${HEALTH_PATH}"
+                    HEALTH_CHECK_PASSED=true
+                    HEALTH_CHECK_METHOD="HTTP"
+                    break
+                  fi
+                fi
+
+                if [ -n "$LOG_PATTERN" ]; then
+                  STARTED=$(SUDO docker logs --tail 50 "${CONTAINER_NAME}" 2>&1 | grep -E "$LOG_PATTERN" || echo "")
+
+                  if [ -n "$STARTED" ]; then
+                    m wf_preview.r_hc_ok_log
+                    echo "   $STARTED"
+                    HEALTH_CHECK_PASSED=true
+                    HEALTH_CHECK_METHOD="Log"
+                    break
+                  fi
+                fi
+              fi
+
+              m wf_preview.r_hc_waiting retry_count="$RETRY_COUNT" max_retries="$MAX_RETRIES" status="$STATUS"
+            done
+
+            if [ "$HEALTH_CHECK_PASSED" = "false" ]; then
+              echo ""
+              m wf_preview.r_hc_timeout
+              echo ""
+              m wf_preview.r_container_logs
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              SUDO docker logs --tail 100 "${CONTAINER_NAME}"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              exit 1
+            fi
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_hc_done health_check_method="${HEALTH_CHECK_METHOD}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: Deploy complete comment
+        if: steps.branch_info.outputs.branch_exists == 'true'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH: ${{ needs.check-command.outputs.custom_branch }}
+          PAW_IN_STEPS_CONTAINER_OUTPUTS_NAME: ${{ steps.container.outputs.name }}
+          PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION: ${{ steps.docker_progress.outputs.docker_duration }}
+          PAW_IN_STEPS_GET_SHA_OUTPUTS_SHA: ${{ steps.get_sha.outputs.sha }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID: ${{ steps.progress.outputs.comment_id }}
+          PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DEPLOY_START: ${{ steps.docker_progress.outputs.deploy_start }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const commentId = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID, 10) || 0;
+            const branchName = process.env.PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH;
+            const dockerDuration = process.env.PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION;
+            const deployStart = parseInt(process.env.PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DEPLOY_START, 10) || Date.now();
+            const now = Date.now();
+            const deployElapsed = now - deployStart;
+            const minutes = Math.floor(deployElapsed / 60000);
+            const seconds = Math.floor((deployElapsed % 60000) / 1000);
+            const deployDuration = minutes > 0 ? m('wf_preview.dur_min_sec', {minutes, seconds}) : m('wf_preview.dur_sec', {seconds});
+
+            const projectName = process.env.PROJECT_PATH !== '.' ? process.env.PROJECT_NAME + '-go' : process.env.PROJECT_NAME;
+            const domainSuffix = process.env.PREVIEW_DOMAIN_SUFFIX;
+            const previewPort = process.env.PREVIEW_PORT;
+            const apiDocsPath = process.env.API_DOCS_PATH;
+            const containerName = process.env.PAW_IN_STEPS_CONTAINER_OUTPUTS_NAME;
+            const domain = `${containerName}.${domainSuffix}`;
+            const previewUrl = `http://${domain}:${previewPort}`;
+            const sha = process.env.PAW_IN_STEPS_GET_SHA_OUTPUTS_SHA;
+
+            // Build the preview environment table
+            const envRows = [
+              `| **Preview URL** | ${previewUrl} |`,
+            ];
+            if (apiDocsPath) {
+              envRows.push(`| **API Docs** | ${previewUrl}${apiDocsPath} |`);
+            }
+            envRows.push(m('wf_preview.env_container_name', {containerName}));
+            envRows.push(m('wf_preview.env_branch', {branchName}));
+            envRows.push(m('wf_preview.env_commit', {sha}));
+
+            const body = [
+              m('wf_preview.title_custom_deployed'),
+              '',
+              m('wf_preview.line_branch', {branchName}),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_done', {dockerDuration}),
+              m('wf_preview.row_deploy_done', {deployDuration}),
+              '',
+              m('wf_preview.sec_env'),
+              m('wf_preview.tbl_items'),
+              '|------|-----|',
+              ...envRows,
+              '',
+              m('wf_preview.sec_commands'),
+              m('wf_preview.tbl_commands'),
+              '|--------|------|',
+              m('wf_preview.cmd_build'),
+              m('wf_preview.cmd_destroy'),
+              m('wf_preview.cmd_status'),
+              '',
+              '<details>',
+              m('wf_preview.cmd_advanced'),
+              '',
+              '```',
+              `/wizard server build ${branchName}`,
+              `/wizard server destroy ${branchName}`,
+              `/wizard server status ${branchName}`,
+              '```',
+              '</details>',
+              '',
+              '---',
+              m('wf_preview.footer_custom')
+            ].join('\n');
+
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: commentId,
+              body: body
+            });
+
+      - name: Build/deploy failure comment
+        if: failure() && steps.load_messages.outcome == 'success' && steps.branch_info.outputs.branch_exists == 'true'
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH: ${{ needs.check-command.outputs.custom_branch }}
+          PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION: ${{ steps.docker_progress.outputs.docker_duration }}
+          PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID: ${{ steps.progress.outputs.comment_id }}
+          PAW_IN_STEPS_PRECHECK_OUTCOME: ${{ steps.precheck.outcome }}
+          PAW_IN_STEPS_PRECHECK_OUTPUTS_MISSING: ${{ steps.precheck.outputs.missing }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const commentId = parseInt(process.env.PAW_IN_STEPS_PROGRESS_OUTPUTS_COMMENT_ID, 10) || 0;
+            const branchName = process.env.PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const dockerDuration = process.env.PAW_IN_STEPS_DOCKER_PROGRESS_OUTPUTS_DOCKER_DURATION;
+
+            let dockerStatus, deployStatus;
+            let dockerTime = '-';
+
+            if (!commentId) {
+              dockerStatus = m('wf_preview.status_init_failed');
+              deployStatus = '-';
+            } else if (process.env.PAW_IN_STEPS_PRECHECK_OUTCOME === 'failure') {
+              // The pre-check stopped the run before any build step: say why nothing ran
+              dockerStatus = deployStatus = m('wf_preview.status_precheck_blocked', { missing: process.env.PAW_IN_STEPS_PRECHECK_OUTPUTS_MISSING || '-' });
+            } else if (!dockerDuration || dockerDuration === '') {
+              // Failed at the Docker build stage; the deploy step never ran
+              dockerStatus = m('wf_preview.status_failed');
+              deployStatus = m('wf_preview.status_not_run');
+            } else {
+              dockerStatus = m('wf_preview.status_done');
+              deployStatus = m('wf_preview.status_failed');
+              dockerTime = dockerDuration;
+            }
+
+            const body = [
+              m('wf_preview.title_custom_failed'),
+              '',
+              m('wf_preview.line_branch', {branchName}),
+              '',
+              m('wf_preview.tbl_steps'),
+              '|------|------|----------|',
+              m('wf_preview.row_docker_status', {dockerStatus, dockerTime}),
+              m('wf_preview.row_deploy_status', {deployStatus}),
+              '',
+              m('wf_preview.link_build_logs', {runUrl}),
+              '',
+              m('wf_preview.sec_causes'),
+              m('wf_preview.hint_secrets'),
+              m('wf_preview.hint_docker_go'),
+              m('wf_preview.hint_start_go'),
+              m('wf_preview.hint_health_timeout'),
+              m('wf_preview.hint_env_missing'),
+              '',
+              m('wf_preview.sec_next'),
+              m('wf_preview.next_logs'),
+              m('wf_preview.next_retry_branch', {branchName}),
+              '',
+              '---',
+              m('wf_preview.footer_custom')
+            ].join('\n');
+
+            if (commentId) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: commentId,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
+
+  # Job 6: destroy custom branch preview
+  destroy-preview-custom-branch:
+    name: Destroy preview (Custom Branch)
+    needs: check-command
+    if: |
+      needs.check-command.outputs.is_valid == 'true' &&
+      needs.check-command.outputs.command == 'destroy' &&
+      needs.check-command.outputs.is_custom_branch == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Messages come from the same revision as this workflow (the PR merge commit on pull_request, otherwise the
+      # default branch) so they exist even before the default branch has them, and before the PR branch is checked out
+      - name: Checkout messages
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+          # Separate path: a sparse checkout at the workspace root would leave the later full checkout sparse too
+          path: .paw-msg
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        run: |
+          # Keep a copy outside the workspace and drop the sparse clone so the later checkout sees a clean tree
+          mkdir -p "$RUNNER_TEMP/paw"
+          [ -f .paw-msg/.github/scripts/messages.py ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          cp .paw-msg/.github/scripts/messages.py "$RUNNER_TEMP/paw/messages.py"
+          LANG_CODE=$(cd .paw-msg && python3 "$RUNNER_TEMP/paw/messages.py" lang)
+          rm -rf .paw-msg
+          # The workspace root has no version.yml; pass the language resolved above to every later messages.py call
+          export PROJECT_AUTO_WIZARD_LANG="$LANG_CODE"
+          python3 "$RUNNER_TEMP/paw/messages.py" dump wf_preview. > "$RUNNER_TEMP/paw-msg.json"
+          echo "PROJECT_AUTO_WIZARD_LANG=$LANG_CODE" >> "$GITHUB_ENV"
+          # The deploy script runs on the remote server, where messages.py does not exist:
+          # ship the messages it needs as a small shell function (m KEY name=value ...)
+          python3 - >> "$GITHUB_ENV" <<'PY'
+          import json, os, shlex, subprocess
+          script = os.path.join(os.environ["RUNNER_TEMP"], "paw", "messages.py")
+          msgs = json.loads(subprocess.check_output(["python3", script, "dump", "wf_preview.r_"], text=True))
+          head = ["m() {", '  case "$1" in']
+          for key, text in msgs.items():
+              head.append("    %s) _t=%s ;;" % (key, shlex.quote(text)))
+          tail = r'''    *) _t="$1" ;;
+            esac
+            shift
+            while [ "$#" -gt 0 ]; do
+              _v=$(printf '%s' "${1#*=}" | sed 's/[\\&|]/\\&/g')
+              _t=$(printf '%s' "$_t" | sed "s|{${1%%=*}}|$_v|g")
+              shift
+            done
+            printf '%s\n' "$_t"
+          }'''
+          print("PAW_REMOTE<<PAW_EOF")
+          print("\n".join(head) + "\n" + tail)
+          print("PAW_EOF")
+          PY
+
+      # Report the missing secrets by name instead of surfacing a raw SSH action error
+      - name: Deploy pre-check (Secrets)
+        id: precheck
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          m() { python3 "$RUNNER_TEMP/paw/messages.py" get "$@"; }
+
+          MISSING=""
+          for NAME in DOCKERHUB_USERNAME SERVER_HOST SERVER_USER; do
+            [ -n "${!NAME}" ] || MISSING="$MISSING $NAME"
+          done
+          # SSH_KEY is required when SSH_AUTH_METHOD=key, otherwise SERVER_PASSWORD
+          if [ "${SSH_AUTH_METHOD:-password}" = "key" ]; then
+            [ -n "$SSH_KEY" ] || MISSING="$MISSING SSH_KEY"
+          else
+            [ -n "$SERVER_PASSWORD" ] || MISSING="$MISSING SERVER_PASSWORD"
+          fi
+          if [ -n "$MISSING" ]; then
+            echo "::error title=$(m wf_preview.precheck_secret_title)::$(m wf_preview.precheck_secret_body missing="$MISSING")"
+            exit 1
+          fi
+
+      - name: Extract container info from branch name
+        id: container_info
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH: ${{ needs.check-command.outputs.custom_branch }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const branchName = process.env.PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH;
+            const projectName = process.env.PROJECT_PATH !== '.' ? process.env.PROJECT_NAME + '-go' : process.env.PROJECT_NAME;
+
+            // Extract the issue number from the branch name (#number pattern)
+            const issueMatch = branchName.match(/#(\d+)/);
+
+            let containerName;
+            if (issueMatch) {
+              containerName = `${projectName}-pr-${issueMatch[1]}`;
+              console.log(m('wf_preview.log_issue_number', {n: issueMatch[1]}));
+            } else {
+              // Generate a hash
+              let hash = 0;
+              for (let i = 0; i < branchName.length; i++) {
+                const char = branchName.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash;
+              }
+              const hashStr = Math.abs(hash).toString(16).slice(-6).padStart(6, '0');
+              containerName = `${projectName}-custom-${hashStr}`;
+              console.log(m('wf_preview.log_hash', {hashStr}));
+            }
+
+            core.setOutput('container_name', containerName);
+            core.setOutput('branch_name', branchName);
+
+      - name: Remove container & image
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SSH_AUTH_METHOD: ${{ env.SSH_AUTH_METHOD }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          envs: SSH_AUTH_METHOD
+          script: |
+            ${{ env.PAW_REMOTE }}
+
+            export PATH=$PATH:/usr/local/bin
+            export PW="${{ secrets.SERVER_PASSWORD }}"
+
+            # sudo wrapper that depends on the SSH auth method
+            SSH_AUTH_METHOD="${SSH_AUTH_METHOD:-password}"
+            if [ "${SSH_AUTH_METHOD}" = "key" ]; then
+              SUDO() { sudo "$@"; }
+            else
+              SUDO() { echo "$PW" | sudo -S "$@"; }
+            fi
+            m wf_preview.r_ssh_auth ssh_auth_method="${SSH_AUTH_METHOD}"
+
+            CONTAINER_NAME="${{ steps.container_info.outputs.container_name }}"
+            PROJECT_NAME="${{ env.PROJECT_PATH != '.' && format('{0}-go', env.PROJECT_NAME) || env.PROJECT_NAME }}"
+
+            # Extract the suffix from the container name
+            SUFFIX="${CONTAINER_NAME#${PROJECT_NAME}-}"
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${PROJECT_NAME}:${SUFFIX}"
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_destroy_head_custom
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_project_name project_name="${PROJECT_NAME}"
+            m wf_preview.r_container_name container_name="${CONTAINER_NAME}"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            m wf_preview.r_container_removing
+            SUDO docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
+
+            m wf_preview.r_image_removing
+            SUDO docker rmi "${IMAGE}" 2>/dev/null || true
+
+            m wf_preview.r_removed
+
+      - name: Destroy complete comment
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH: ${{ needs.check-command.outputs.custom_branch }}
+          PAW_IN_STEPS_CONTAINER_INFO_OUTPUTS_CONTAINER_NAME: ${{ steps.container_info.outputs.container_name }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const branchName = process.env.PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH;
+            const containerName = process.env.PAW_IN_STEPS_CONTAINER_INFO_OUTPUTS_CONTAINER_NAME;
+
+            const body = [
+              m('wf_preview.title_custom_destroyed'),
+              '',
+              m('wf_preview.tbl_items'),
+              '|------|-----|',
+              m('wf_preview.env_branch', {branchName}),
+              m('wf_preview.env_container_name', {containerName}),
+              m('wf_preview.env_status_deleted'),
+              '',
+              m('wf_preview.redeploy_hint_branch', {branchName}),
+              '',
+              '---',
+              m('wf_preview.footer_custom')
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+  # Job 7: custom branch preview status
+  check-status-custom-branch:
+    name: Preview status (Custom Branch)
+    needs: check-command
+    if: |
+      needs.check-command.outputs.is_valid == 'true' &&
+      needs.check-command.outputs.command == 'status' &&
+      needs.check-command.outputs.is_custom_branch == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # Messages come from the same revision as this workflow (the PR merge commit on pull_request, otherwise the
+      # default branch) so they exist even before the default branch has them, and before the PR branch is checked out
+      - name: Checkout messages
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+          # Separate path: a sparse checkout at the workspace root would leave the later full checkout sparse too
+          path: .paw-msg
+          sparse-checkout: |
+            .github/scripts/messages.py
+            version.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Load messages
+        run: |
+          # Keep a copy outside the workspace and drop the sparse clone so the later checkout sees a clean tree
+          mkdir -p "$RUNNER_TEMP/paw"
+          [ -f .paw-msg/.github/scripts/messages.py ] || { echo "::error::messages.py is missing; rerun \`npx project-auto-wizard --mode full --force\`"; exit 1; }
+          cp .paw-msg/.github/scripts/messages.py "$RUNNER_TEMP/paw/messages.py"
+          LANG_CODE=$(cd .paw-msg && python3 "$RUNNER_TEMP/paw/messages.py" lang)
+          rm -rf .paw-msg
+          # The workspace root has no version.yml; pass the language resolved above to every later messages.py call
+          export PROJECT_AUTO_WIZARD_LANG="$LANG_CODE"
+          python3 "$RUNNER_TEMP/paw/messages.py" dump wf_preview. > "$RUNNER_TEMP/paw-msg.json"
+          echo "PROJECT_AUTO_WIZARD_LANG=$LANG_CODE" >> "$GITHUB_ENV"
+          # The deploy script runs on the remote server, where messages.py does not exist:
+          # ship the messages it needs as a small shell function (m KEY name=value ...)
+          python3 - >> "$GITHUB_ENV" <<'PY'
+          import json, os, shlex, subprocess
+          script = os.path.join(os.environ["RUNNER_TEMP"], "paw", "messages.py")
+          msgs = json.loads(subprocess.check_output(["python3", script, "dump", "wf_preview.r_"], text=True))
+          head = ["m() {", '  case "$1" in']
+          for key, text in msgs.items():
+              head.append("    %s) _t=%s ;;" % (key, shlex.quote(text)))
+          tail = r'''    *) _t="$1" ;;
+            esac
+            shift
+            while [ "$#" -gt 0 ]; do
+              _v=$(printf '%s' "${1#*=}" | sed 's/[\\&|]/\\&/g')
+              _t=$(printf '%s' "$_t" | sed "s|{${1%%=*}}|$_v|g")
+              shift
+            done
+            printf '%s\n' "$_t"
+          }'''
+          print("PAW_REMOTE<<PAW_EOF")
+          print("\n".join(head) + "\n" + tail)
+          print("PAW_EOF")
+          PY
+
+      # Report the missing secrets by name instead of surfacing a raw SSH action error
+      - name: Deploy pre-check (Secrets)
+        id: precheck
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          m() { python3 "$RUNNER_TEMP/paw/messages.py" get "$@"; }
+
+          MISSING=""
+          for NAME in SERVER_HOST SERVER_USER; do
+            [ -n "${!NAME}" ] || MISSING="$MISSING $NAME"
+          done
+          # SSH_KEY is required when SSH_AUTH_METHOD=key, otherwise SERVER_PASSWORD
+          if [ "${SSH_AUTH_METHOD:-password}" = "key" ]; then
+            [ -n "$SSH_KEY" ] || MISSING="$MISSING SSH_KEY"
+          else
+            [ -n "$SERVER_PASSWORD" ] || MISSING="$MISSING SERVER_PASSWORD"
+          fi
+          if [ -n "$MISSING" ]; then
+            echo "::error title=$(m wf_preview.precheck_secret_title)::$(m wf_preview.precheck_secret_body missing="$MISSING")"
+            exit 1
+          fi
+
+      - name: Extract container info from branch name
+        id: container_info
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH: ${{ needs.check-command.outputs.custom_branch }}
+        with:
+          script: |
+            const branchName = process.env.PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH;
+            const projectName = process.env.PROJECT_PATH !== '.' ? process.env.PROJECT_NAME + '-go' : process.env.PROJECT_NAME;
+
+            // Extract the issue number from the branch name (#number pattern)
+            const issueMatch = branchName.match(/#(\d+)/);
+
+            let containerName;
+            if (issueMatch) {
+              containerName = `${projectName}-pr-${issueMatch[1]}`;
+            } else {
+              // Generate a hash
+              let hash = 0;
+              for (let i = 0; i < branchName.length; i++) {
+                const char = branchName.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash;
+              }
+              const hashStr = Math.abs(hash).toString(16).slice(-6).padStart(6, '0');
+              containerName = `${projectName}-custom-${hashStr}`;
+            }
+
+            core.setOutput('container_name', containerName);
+            core.setOutput('branch_name', branchName);
+
+      - name: Check container status
+        uses: appleboy/ssh-action@v1.0.3
+        id: check_running
+        continue-on-error: true
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          password: ${{ secrets.SERVER_PASSWORD }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ env.SSH_PORT }}
+          script: |
+            ${{ env.PAW_REMOTE }}
+
+            export PATH=$PATH:/usr/local/bin
+
+            CONTAINER_NAME="${{ steps.container_info.outputs.container_name }}"
+
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            m wf_preview.r_status_head_custom
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            if docker ps --filter "name=${CONTAINER_NAME}" --format "{{.Names}}" | grep -q "${CONTAINER_NAME}"; then
+              echo "STATUS=running"
+              m wf_preview.r_container_running
+              docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"
+            else
+              echo "STATUS=not_found"
+              m wf_preview.r_container_absent
+              exit 1
+            fi
+
+      - name: Post status comment
+        uses: actions/github-script@v9
+        env:
+          PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH: ${{ needs.check-command.outputs.custom_branch }}
+          PAW_IN_STEPS_CHECK_RUNNING_OUTCOME: ${{ steps.check_running.outcome }}
+          PAW_IN_STEPS_CONTAINER_INFO_OUTPUTS_CONTAINER_NAME: ${{ steps.container_info.outputs.container_name }}
+        with:
+          script: |
+            const M = JSON.parse(require('fs').readFileSync(`${process.env.RUNNER_TEMP}/paw-msg.json`, 'utf8'));
+            const m = (k, p = {}) => M[k].replace(/\{(\w+)\}/g, (s, n) => (n in p ? p[n] : s));
+
+            const branchName = process.env.PAW_IN_NEEDS_CHECK_COMMAND_OUTPUTS_CUSTOM_BRANCH;
+            const containerName = process.env.PAW_IN_STEPS_CONTAINER_INFO_OUTPUTS_CONTAINER_NAME;
+            const projectName = process.env.PROJECT_PATH !== '.' ? process.env.PROJECT_NAME + '-go' : process.env.PROJECT_NAME;
+            const domainSuffix = process.env.PREVIEW_DOMAIN_SUFFIX;
+            const previewPort = process.env.PREVIEW_PORT;
+            const domain = `${containerName}.${domainSuffix}`;
+            const previewUrl = `http://${domain}:${previewPort}`;
+            const isRunning = process.env.PAW_IN_STEPS_CHECK_RUNNING_OUTCOME === 'success';
+
+            let body;
+            if (isRunning) {
+              body = [
+                m('wf_preview.title_custom_running'),
+                '',
+                m('wf_preview.tbl_items'),
+                '|------|-----|',
+                m('wf_preview.env_branch', {branchName}),
+                `| **Preview URL** | ${previewUrl} |`,
+                m('wf_preview.env_container_name', {containerName}),
+                m('wf_preview.env_status_running'),
+                '',
+                m('wf_preview.sec_commands'),
+                m('wf_preview.tbl_commands'),
+                '|--------|------|',
+                m('wf_preview.cmd_build_branch', {branchName}),
+                m('wf_preview.cmd_destroy_branch', {branchName}),
+                '',
+                '---',
+                m('wf_preview.footer_custom')
+              ].join('\n');
+            } else {
+              body = [
+                m('wf_preview.title_custom_absent'),
+                '',
+                m('wf_preview.tbl_items'),
+                '|------|-----|',
+                m('wf_preview.env_branch', {branchName}),
+                m('wf_preview.env_container_name', {containerName}),
+                m('wf_preview.env_status_absent'),
+                '',
+                m('wf_preview.deploy_hint_branch', {branchName}),
+                '',
+                '---',
+                m('wf_preview.footer_custom')
+              ].join('\n');
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
