@@ -1,0 +1,34 @@
+{
+  "metadata": {
+    "lastUpdated": "2026-10-16T05:06:28Z",
+    "currentVersion": "1.0.1",
+    "projectTypes": [
+      "go",
+      "python",
+      "react"
+    ],
+    "totalReleases": 1
+  },
+  "releases": [
+    {
+      "version": "1.0.1",
+      "project_types": [
+        "go",
+        "python",
+        "react"
+      ],
+      "date": "2026-10-16",
+      "pr_number": null,
+      "raw_summary": "### 🔧 변경사항\n- project-auto-wizard 0.17.0 설치 (mono)",
+      "parsed_changes": {
+        "changes": {
+          "title": "🔧 변경사항",
+          "items": [
+            "project-auto-wizard 0.17.0 설치 (mono)"
+          ]
+        }
+      },
+      "parse_method": "markdown"
+    }
+  ]
+}
